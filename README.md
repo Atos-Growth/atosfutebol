@@ -1,4 +1,3 @@
-
 App em React, Vite, Tailwind e Supabase para administrar a pelada.
 
 ## Executar
@@ -107,6 +106,3 @@ A migração adiciona `times.forca_media`, `sessoes.horario_fim` e atualiza a RP
 de sorteio para calcular a média diretamente das estrelas persistidas em
 `participantes`. O encerramento da sessão passa a ser confirmado no banco antes
 da navegação para o histórico.
-=======
-
-App para controle e sorteio da pelada semanal
