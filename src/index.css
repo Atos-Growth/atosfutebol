@@ -3,9 +3,9 @@
 @tailwind components;
 @tailwind utilities;
 
-:root { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #071812; background: #f7f7f1; font-synthesis: none; }
+:root { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #0D1B2A; background: #FAF7F0; font-synthesis: none; }
 * { box-sizing: border-box; }
-body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradient(circle at 85% -10%, rgba(204,255,51,.22), transparent 30%), #f7f7f1; }
+body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradient(circle at 85% -10%, rgba(77,216,207,.22), transparent 30%), #FAF7F0; }
 button, input, select { font: inherit; }
 button { -webkit-tap-highlight-color: transparent; }
 
@@ -13,7 +13,7 @@ button { -webkit-tap-highlight-color: transparent; }
   .panel { @apply rounded-[24px] border border-ink/10 bg-white shadow-card; }
   .btn { @apply inline-flex min-h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-bold transition active:scale-[.98] disabled:cursor-not-allowed disabled:opacity-50; }
   .btn-primary { @apply btn bg-ink text-white hover:bg-turf-900; }
-  .btn-lime { @apply btn bg-lime text-ink hover:bg-[#baf026]; }
+  .btn-lime { @apply btn bg-lime text-ink hover:bg-[#35bfb5]; }
   .btn-soft { @apply btn bg-ink/5 text-ink hover:bg-ink/10; }
   .label { @apply mb-1.5 block text-xs font-bold uppercase tracking-[.12em] text-ink/55; }
   .input { @apply h-12 w-full rounded-xl border border-ink/15 bg-white px-3.5 text-sm outline-none transition placeholder:text-ink/35 focus:border-turf-500 focus:shadow-glow; }
