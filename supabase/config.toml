@@ -1,0 +1,8 @@
+[functions.notificar-cadastro]
+verify_jwt = false
+
+[functions.aprovar-cadastro]
+verify_jwt = true
+
+[functions.rejeitar-cadastro]
+verify_jwt = true
