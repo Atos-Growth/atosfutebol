@@ -1,3 +1,5 @@
+# Atos Futebol
+
 App em React, Vite, Tailwind e Supabase para administrar a pelada.
 
 ## Executar
