@@ -71,6 +71,7 @@ function App() {
   const [status, setStatus] = useState<SessionStatus>('aguardando_checkin')
   const [teamSize, setTeamSize] = useState(6)
   const [duration, setDuration] = useState(10)
+  const [showSettings, setShowSettings] = useState(false)
   const [mobileMenu, setMobileMenu] = useState(false)
   const [loading, setLoading] = useState(hasSupabase)
   const [authEmail, setAuthEmail] = useState<string | null>(hasSupabase ? null : 'Modo demonstração')
@@ -191,19 +192,44 @@ function App() {
     {mobileMenu && <button className="fixed inset-0 z-30 bg-ink/50 md:hidden" onClick={() => setMobileMenu(false)} aria-label="Fechar menu" />}
 
     <main className="min-w-0 flex-1">
-      <header className="flex h-20 items-center justify-between border-b border-ink/8 px-4 md:px-8"><div className="flex items-center gap-3"><button className="rounded-xl bg-white p-2.5 shadow-sm md:hidden" onClick={() => setMobileMenu(true)} aria-label="Abrir menu"><Menu size={20} /></button>{view !== 'inicio' && <div><p className="text-[11px] font-extrabold uppercase tracking-[.15em] text-turf-600">Pelada de domingo</p><h1 className="text-lg font-extrabold md:text-xl">{pageTitle[view]}</h1></div>}</div><div className="hidden items-center gap-3 sm:flex"><span className={`chip ${hasSupabase ? 'bg-turf-100 text-turf-700' : 'bg-amber-100 text-amber-800'}`}>{hasSupabase ? <><span className="h-1.5 w-1.5 rounded-full bg-turf-500" /> Sincronizado</> : 'Modo demo'}</span>{papel === 'admin' && <button className="btn-soft !min-h-10 !px-3" aria-label="Configurações"><Settings2 size={18} /></button>}</div></header>
+      <header className="flex h-20 items-center justify-between border-b border-ink/8 px-4 md:px-8"><div className="flex items-center gap-3"><button className="rounded-xl bg-white p-2.5 shadow-sm md:hidden" onClick={() => setMobileMenu(true)} aria-label="Abrir menu"><Menu size={20} /></button>{view !== 'inicio' && <div><p className="text-[11px] font-extrabold uppercase tracking-[.15em] text-turf-600">Pelada de domingo</p><h1 className="text-lg font-extrabold md:text-xl">{pageTitle[view]}</h1></div>}</div><div className="hidden items-center gap-3 sm:flex"><span className={`chip ${hasSupabase ? 'bg-turf-100 text-turf-700' : 'bg-amber-100 text-amber-800'}`}>{hasSupabase ? <><span className="h-1.5 w-1.5 rounded-full bg-turf-500" /> Sincronizado</> : 'Modo demo'}</span>{papel === 'admin' && <button onClick={() => setShowSettings(true)} className="btn-soft !min-h-10 !px-3" aria-label="Configurações"><Settings2 size={18} /></button>}</div></header>
       <div className="mx-auto max-w-[1440px] p-4 pb-24 md:p-8">
         {view === 'inicio' && <Dashboard players={players} checkins={checkins} teams={teams} match={match} setView={setView} />}
         {view === 'participantes' && <Participants players={players} setPlayers={setPlayers} papel={papel} userId={userId} />}
-        {view === 'checkin' && <Checkin players={players} checkins={checkins} setCheckins={setCheckins} sessionId={sessionId} />}
-        {view === 'sorteio' && <Draw players={players} checkins={checkins} setCheckins={setCheckins} teams={teams} setTeams={setTeams} teamSize={teamSize} setTeamSize={setTeamSize} sessionId={sessionId} setStatus={setStatus} goLive={() => setView('partida')} />}
+        {view === 'checkin' && <Checkin players={players} checkins={checkins} setCheckins={setCheckins} sessionId={sessionId} teamSize={teamSize} />}
+        {view === 'sorteio' && <Draw players={players} checkins={checkins} setCheckins={setCheckins} teams={teams} setTeams={setTeams} teamSize={teamSize} setTeamSize={setTeamSize} sessionId={sessionId} setStatus={setStatus} status={status} goLive={() => setView('partida')} />}
         {view === 'partida' && (!sessionReady ? <WaitingSession /> : <LiveMatch readOnly={papel === 'normal'} teams={teams} setTeams={setTeams} players={players} match={match} setMatch={setMatch} events={events} setEvents={setEvents} sessionId={sessionId} duration={duration} setDuration={setDuration} />)}
         {view === 'encerramento' && <Closure players={players} events={events} sessionId={sessionId} onFinished={() => { setStatus('finalizada'); setView('historico') }} />}
         {view === 'historico' && <HistoryPage players={players} events={events} />}
         {view === 'aprovacoes' && papel === 'admin' && <Approvals />}
       </div>
     </main>
+    {showSettings && <SessionSettingsModal duration={duration} sessionId={sessionId} onClose={() => setShowSettings(false)} onSaved={(newDuration) => { setDuration(newDuration); setShowSettings(false) }} />}
   </div>
+}
+
+function SessionSettingsModal({ duration, sessionId, onClose, onSaved }: { duration: number; sessionId: string; onClose: () => void; onSaved: (duration: number) => void }) {
+  const [newDuration, setNewDuration] = useState(String(duration))
+  const [saving, setSaving] = useState(false)
+
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault()
+    const value = Number(newDuration)
+    if (!Number.isInteger(value) || value < 1 || value > 60) return toast.error('Informe uma duração entre 1 e 60 minutos.')
+    setSaving(true)
+    if (supabase) {
+      const { error } = await supabase.from('sessoes').update({ duracao_partida_minutos: value }).eq('id', sessionId)
+      if (error) {
+        setSaving(false)
+        toast.error(error.message)
+        return
+      }
+    }
+    onSaved(value)
+    toast.success('Duração atualizada para a próxima partida!')
+  }
+
+  return <Modal title="Configurações da sessão" onClose={onClose}><form onSubmit={save}><label className="label" htmlFor="session-duration">Duração da partida (minutos)</label><input id="session-duration" className="input" type="number" inputMode="numeric" min={1} max={60} step={1} value={newDuration} onChange={(e) => setNewDuration(e.target.value)} required /><p className="mt-3 text-xs leading-relaxed text-ink/45">A mudança afeta somente a próxima partida a ser iniciada. A partida que já estiver em andamento mantém o tempo atual.</p><div className="mt-6 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end"><button type="button" onClick={onClose} className="btn-soft w-full sm:w-auto">Cancelar</button><button disabled={saving} className="btn-primary w-full sm:w-auto"><Check size={17} /> {saving ? 'Salvando...' : 'Salvar'}</button></div></form></Modal>
 }
 
 function AuthScreen() {
@@ -352,35 +378,86 @@ function Participants({ players, setPlayers, papel, userId }: { players: Partici
   </div>
 }
 
-function Checkin({ players, checkins, setCheckins, sessionId }: { players: Participante[]; checkins: CheckIn[]; setCheckins: React.Dispatch<React.SetStateAction<CheckIn[]>>; sessionId: string }) {
+function Checkin({ players, checkins, setCheckins, sessionId, teamSize }: { players: Participante[]; checkins: CheckIn[]; setCheckins: React.Dispatch<React.SetStateAction<CheckIn[]>>; sessionId: string; teamSize: number }) {
   const [search, setSearch] = useState(''); const ids = new Set(checkins.map((c) => c.participante_id))
   const toggle = async (p: Participante) => { const existing = checkins.find((c) => c.participante_id === p.id); if (existing) { setCheckins((old) => old.filter((c) => c.id !== existing.id)); if (supabase) await supabase.from('check_ins').delete().eq('id', existing.id); toast('Check-in desmarcado') } else { const item = { id: uid(), participante_id: p.id, horario_chegada: new Date().toISOString(), alocado: false }; if (supabase) { const { data, error } = await supabase.from('check_ins').insert({ sessao_id: sessionId, participante_id: p.id }).select().single(); if (error) return toast.error(error.message); setCheckins((old) => [...old, data as CheckIn]) } else setCheckins((old) => [...old, item]); toast.success(`${p.nome} chegou!`) } }
   const ordered = players.filter((p) => p.ativo && p.nome.toLowerCase().includes(search.toLowerCase())).sort((a, b) => Number(ids.has(b.id)) - Number(ids.has(a.id)))
-  return <div><div className="grid gap-4 sm:grid-cols-3"><div className="panel col-span-2 flex items-center gap-4 p-5"><div className="grid h-14 w-14 place-items-center rounded-2xl bg-turf-100 text-turf-700"><ClipboardCheck size={27} /></div><div><p className="text-3xl font-black">{checkins.length}</p><p className="text-sm font-bold">jogadores presentes</p><p className="text-xs text-ink/40">{Math.floor(checkins.length / 6)} times de 6 possíveis</p></div></div><div className="panel hidden items-center gap-3 p-5 sm:flex"><Clock3 className="text-orange" /><div><p className="text-sm font-bold">Ordem de chegada</p><p className="text-xs text-ink/40">Usada como prioridade</p></div></div></div>
+  return <div><div className="grid gap-4 sm:grid-cols-3"><div className="panel col-span-2 flex items-center gap-4 p-5"><div className="grid h-14 w-14 place-items-center rounded-2xl bg-turf-100 text-turf-700"><ClipboardCheck size={27} /></div><div><p className="text-3xl font-black">{checkins.length}</p><p className="text-sm font-bold">jogadores presentes</p><p className="text-xs text-ink/40">{Math.floor(checkins.length / teamSize)} times de {teamSize} na linha possíveis</p></div></div><div className="panel hidden items-center gap-3 p-5 sm:flex"><Clock3 className="text-orange" /><div><p className="text-sm font-bold">Ordem de chegada</p><p className="text-xs text-ink/40">Usada como prioridade</p></div></div></div>
     <div className="panel mt-5 overflow-hidden"><div className="border-b border-ink/8 p-4"><div className="relative max-w-md"><Search className="absolute left-3 top-3.5 text-ink/35" size={18} /><input className="input pl-10" placeholder="Quem acabou de chegar?" value={search} onChange={(e) => setSearch(e.target.value)} /></div></div><div className="grid gap-px bg-ink/7 md:grid-cols-2">{ordered.map((p) => { const check = checkins.find((c) => c.participante_id === p.id); return <button key={p.id} onClick={() => toggle(p)} className={`flex items-center gap-3 bg-white p-4 text-left transition hover:bg-turf-50 ${check ? 'ring-2 ring-inset ring-turf-500/20' : ''}`}><Avatar player={p} /><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{p.nome}</p><p className="mt-1 text-xs text-ink/40">{positionLabel[p.posicao]} · {p.estrelas} estrelas</p></div>{check ? <div className="text-right"><span className="inline-grid h-8 w-8 place-items-center rounded-full bg-turf-500 text-white"><Check size={17} /></span><p className="mt-1 text-[10px] font-bold text-turf-700">{format(new Date(check.horario_chegada), 'HH:mm')}</p></div> : <span className="grid h-8 w-8 place-items-center rounded-full bg-ink/5 text-ink/30"><Plus size={17} /></span>}</button> })}</div></div>
   </div>
 }
 
+function selectDrawParticipants(available: Participante[], teamSize: number, count: number) {
+  if (!count) return []
+  const selected = available.slice(0, count * teamSize)
+  for (const player of available.slice(selected.length)) {
+    const keeperSlots = Math.min(count, selected.filter((item) => item.posicao === 'goleiro').length)
+    const capacity = count * teamSize + keeperSlots
+    const opensKeeperSlot = player.posicao === 'goleiro' && keeperSlots < count
+    if (selected.length < capacity || opensKeeperSlot) selected.push(player)
+    else break
+  }
+  return selected
+}
+
+function shuffleEqualStarGroups(players: Participante[]) {
+  const sorted = [...players].sort((a, b) => b.estrelas - a.estrelas)
+  const shuffled: Participante[] = []
+  let start = 0
+  while (start < sorted.length) {
+    let end = start + 1
+    while (end < sorted.length && sorted[end].estrelas === sorted[start].estrelas) end++
+    const group = sorted.slice(start, end)
+    for (let i = group.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1))
+      ;[group[i], group[j]] = [group[j], group[i]]
+    }
+    shuffled.push(...group)
+    start = end
+  }
+  return shuffled
+}
+
 function serpentineDraw(available: Participante[], teamSize: number): Time[] {
-  const count = Math.floor(available.length / teamSize); if (count < 2) return []
-  const selected = available.slice(0, count * teamSize); const result: Time[] = Array.from({ length: count }, (_, i) => ({ id: uid(), numero: i + 1, posicao_fila: i + 1, status: i < 2 ? 'jogando' as const : 'na_fila' as const, forca_media: null, jogadores: [] as Participante[] }))
-  const keepers = selected.filter((p) => p.posicao === 'goleiro').sort((a, b) => b.estrelas - a.estrelas); const used = new Set<string>()
-  for (let i = 0; i < Math.min(keepers.length, count); i++) { result[i].jogadores.push(keepers[i]); used.add(keepers[i].id) }
-  const field = selected.filter((p) => !used.has(p.id)).sort((a, b) => b.estrelas - a.estrelas)
-  let index = 0; let direction = 1
-  for (const player of field) { let attempts = 0; while (result[index].jogadores.length >= teamSize && attempts < count) { index = (index + direction + count) % count; attempts++ } result[index].jogadores.push(player); index += direction; if (index >= count) { index = count - 1; direction = -1 } else if (index < 0) { index = 0; direction = 1 } }
+  const count = Math.floor(available.length / teamSize)
+  if (count < 2) return []
+  const selected = selectDrawParticipants(available, teamSize, count)
+  const result: Time[] = Array.from({ length: count }, (_, i) => ({ id: uid(), numero: i + 1, posicao_fila: i + 1, status: i < 2 ? 'jogando' as const : 'na_fila' as const, forca_media: null, jogadores: [] as Participante[] }))
+  const keepers = shuffleEqualStarGroups(selected.filter((p) => p.posicao === 'goleiro'))
+  const used = new Set<string>()
+  const hasKeeper = result.map(() => false)
+  for (let i = 0; i < Math.min(keepers.length, count); i++) { result[i].jogadores.push(keepers[i]); hasKeeper[i] = true; used.add(keepers[i].id) }
+  const caps = result.map((_, index) => teamSize + (hasKeeper[index] ? 1 : 0))
+  const field = shuffleEqualStarGroups(selected.filter((p) => !used.has(p.id)))
+  let index = 0
+  let direction = 1
+  const advance = () => {
+    index += direction
+    if (index >= count) { index = count - 1; direction = -1 }
+    else if (index < 0) { index = 0; direction = 1 }
+  }
+  for (const player of field) {
+    const visited = new Set<number>()
+    while (result[index].jogadores.length >= caps[index] && visited.size < count) { visited.add(index); advance() }
+    if (result[index].jogadores.length >= caps[index]) break
+    result[index].jogadores.push(player)
+    advance()
+  }
   result.forEach((team) => { team.forca_media = Number((team.jogadores.reduce((sum, player) => sum + player.estrelas, 0) / team.jogadores.length).toFixed(2)) })
   return result
 }
 
-function Draw({ players, checkins, setCheckins, teams, setTeams, teamSize, setTeamSize, sessionId, setStatus, goLive }: { players: Participante[]; checkins: CheckIn[]; setCheckins: React.Dispatch<React.SetStateAction<CheckIn[]>>; teams: Time[]; setTeams: React.Dispatch<React.SetStateAction<Time[]>>; teamSize: number; setTeamSize: (n: number) => void; sessionId: string; setStatus: (s: SessionStatus) => void; goLive: () => void }) {
+function Draw({ players, checkins, setCheckins, teams, setTeams, teamSize, setTeamSize, sessionId, setStatus, status, goLive }: { players: Participante[]; checkins: CheckIn[]; setCheckins: React.Dispatch<React.SetStateAction<CheckIn[]>>; teams: Time[]; setTeams: React.Dispatch<React.SetStateAction<Time[]>>; teamSize: number; setTeamSize: (n: number) => void; sessionId: string; setStatus: (s: SessionStatus) => void; status: SessionStatus; goLive: () => void }) {
   const available = checkins.filter((c) => !c.alocado).sort((a,b) => +new Date(a.horario_chegada) - +new Date(b.horario_chegada)).map((c) => players.find((p) => p.id === c.participante_id)).filter(Boolean) as Participante[]
-  const eligible = teams.length ? checkins.length : available.length; const possible = Math.floor(eligible / teamSize)
-  const draw = () => { const pool = teams.length ? checkins.map((c) => players.find((p) => p.id === c.participante_id)!).filter(Boolean) : available; const result = serpentineDraw(pool, teamSize); if (result.length < 2) return toast.error(`Faltam ${teamSize * 2 - pool.length} jogadores para formar dois times.`); setTeams(result); setStatus('sorteando'); toast.success(`${result.length} times equilibrados!`) }
+  const pool = teams.length ? checkins.map((c) => players.find((p) => p.id === c.participante_id)!).filter(Boolean) : available
+  const possible = Math.floor(pool.length / teamSize)
+  const reserves = pool.length - selectDrawParticipants(pool, teamSize, possible).length
+  const drawLocked = status === 'em_andamento' || status === 'finalizada'
+  const draw = () => { if (drawLocked) return toast.error('O sorteio desta sessão já foi confirmado.'); const result = serpentineDraw(pool, teamSize); if (result.length < 2) return toast.error(`Faltam ${teamSize * 2 - pool.length} jogadores para formar dois times.`); setTeams(result); setStatus('sorteando'); toast.success(`${result.length} times equilibrados!`) }
   const swap = (teamIndex: number, player: Participante) => { const next = (teamIndex + 1) % teams.length; setTeams((old) => old.map((t, i) => i === teamIndex ? { ...t, jogadores: t.jogadores.filter((p) => p.id !== player.id).concat(old[next].jogadores[0] ? [old[next].jogadores[0]] : []) } : i === next ? { ...t, jogadores: t.jogadores.slice(1).concat(player) } : t)); toast('Jogadores trocados') }
   const confirm = async () => { if (supabase) { const { error } = await supabase.rpc('confirmar_sorteio', { p_sessao_id: sessionId, p_times: teams.map((t) => ({ numero: t.numero, jogadores: t.jogadores.map((p) => p.id) })) }); if (error) return toast.error(error.message); const loaded = await supabase.from('times').select('*, times_jogadores(participantes(*))').eq('sessao_id', sessionId).order('posicao_fila'); if (loaded.error) return toast.error(loaded.error.message); setTeams((loaded.data ?? []).map((t) => ({ ...t, jogadores: t.times_jogadores.map((j: { participantes: Participante }) => j.participantes) })) as Time[]) } setCheckins((old) => old.map((c) => teams.some((t) => t.jogadores.some((p) => p.id === c.participante_id)) ? { ...c, alocado: true } : c)); setStatus('em_andamento'); toast.success('Times confirmados. Bora jogar!'); goLive() }
-  return <div><div className="panel flex flex-col justify-between gap-5 p-5 sm:flex-row sm:items-center"><div><p className="text-sm font-bold">Formato dos times</p><p className="mt-1 text-xs text-ink/45">O goleiro já está incluído no total.</p></div><div className="flex rounded-xl bg-ink/5 p-1">{[6,7].map((n) => <button key={n} onClick={() => { setTeamSize(n); if (teams.length) setTeams([]) }} className={`rounded-lg px-5 py-2 text-sm font-bold transition ${teamSize === n ? 'bg-white shadow-sm' : 'text-ink/40'}`}>{n} × {n}</button>)}</div><div className="sm:text-right"><p className="text-2xl font-black">{possible}</p><p className="text-xs text-ink/45">times completos possíveis</p></div></div>
-    {!teams.length ? <div className="panel mt-5 grid min-h-[420px] place-items-center overflow-hidden p-6 text-center"><div className="max-w-lg"><div className="mx-auto grid h-20 w-20 place-items-center rounded-[28px] bg-lime text-ink"><Sparkles size={35} /></div><h2 className="mt-6 text-2xl font-black">Equilibre o jogo em segundos</h2><p className="mt-3 text-sm leading-relaxed text-ink/50">Vamos priorizar goleiros, ordenar por nível e distribuir em serpentina. Só entram times completos; quem sobrar continua como reserva.</p><div className="mx-auto mt-6 flex max-w-sm items-center justify-center gap-5 rounded-2xl bg-ink/[.035] p-4"><div><b className="text-xl">{available.length}</b><p className="text-[11px] text-ink/40">disponíveis</p></div><div className="h-8 w-px bg-ink/10" /><div><b className="text-xl">{possible}</b><p className="text-[11px] text-ink/40">times</p></div><div className="h-8 w-px bg-ink/10" /><div><b className="text-xl">{eligible % teamSize}</b><p className="text-[11px] text-ink/40">reservas</p></div></div><button onClick={draw} disabled={possible < 2} className="btn-lime mt-7 min-w-48"><Sparkles size={18} /> Sortear agora</button>{possible < 2 && <p className="mt-3 text-xs font-semibold text-orange">São necessários pelo menos {teamSize * 2} presentes.</p>}</div></div> : <><div className="mt-5 flex items-center justify-between"><div><p className="font-extrabold">Prévia dos times</p><p className="text-xs text-ink/45">Toque nas setas para fazer um ajuste rápido.</p></div><button onClick={draw} className="btn-soft"><RotateCcw size={16} /> Refazer</button></div><div className="mt-4 grid gap-4 lg:grid-cols-2 xl:grid-cols-3">{teams.map((team, ti) => <div key={team.id} className="panel overflow-hidden"><div className="flex items-center justify-between p-4 text-white" style={{ background: ti < 2 ? '#0D1B2A' : '#1B3A5C' }}><div className="flex items-center gap-2"><span className="grid h-9 w-9 place-items-center rounded-xl text-sm font-black text-ink" style={{ background: teamColors[ti % teamColors.length] }}>{team.numero}</span><div><p className="text-sm font-extrabold">Time {team.numero}</p><p className="text-[10px] text-white/45">{team.jogadores.reduce((n,p) => n + p.estrelas, 0)} estrelas no total</p></div></div><span className="chip bg-white/10 text-white/70">{ti < 2 ? 'Joga agora' : `${ti + 1}º na fila`}</span></div><div className="divide-y divide-ink/7">{team.jogadores.map((p) => <div key={p.id} className="flex items-center gap-3 p-3.5"><Avatar player={p} size="sm" ring={p.posicao === 'goleiro' ? teamColors[ti % teamColors.length] : undefined} /><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{p.nome}</p><div className="flex items-center gap-2"><span className="text-[10px] text-ink/40">{positionLabel[p.posicao]}</span><Stars value={p.estrelas} /></div></div><button onClick={() => swap(ti, p)} className="rounded-lg p-2 text-ink/25 hover:bg-ink/5 hover:text-ink" title="Trocar com próximo time"><ArrowLeftRight size={16} /></button></div>)}</div></div>)}</div><div className="sticky bottom-4 mt-6 flex justify-end"><button onClick={confirm} className="btn-lime shadow-xl"><Check size={18} /> Confirmar times e iniciar</button></div></>}
+  return <div><div className="panel flex flex-col justify-between gap-5 p-5 sm:flex-row sm:items-center"><div><p className="text-sm font-bold">Formato dos times</p><p className="mt-1 text-xs text-ink/45">Times de linha — o goleiro entra além do número mostrado, quando houver um disponível.</p></div><div>{drawLocked && <p className="mb-2 max-w-xs text-xs font-semibold leading-relaxed text-amber-700">Sorteio já confirmado para hoje — para mudar o formato, será preciso esperar a próxima sessão.</p>}<div className="flex rounded-xl bg-ink/5 p-1">{[5,6].map((n) => <button key={n} disabled={drawLocked} onClick={() => { if (drawLocked) return; setTeamSize(n); if (teams.length) setTeams([]) }} className={`rounded-lg px-5 py-2 text-sm font-bold transition disabled:cursor-not-allowed disabled:opacity-45 ${teamSize === n ? 'bg-white shadow-sm' : 'text-ink/40'}`}>{n} × {n}</button>)}</div></div><div className="sm:text-right"><p className="text-2xl font-black">{possible}</p><p className="text-xs text-ink/45">times completos possíveis</p></div></div>
+    {!teams.length ? <div className="panel mt-5 grid min-h-[420px] place-items-center overflow-hidden p-6 text-center"><div className="max-w-lg"><div className="mx-auto grid h-20 w-20 place-items-center rounded-[28px] bg-lime text-ink"><Sparkles size={35} /></div><h2 className="mt-6 text-2xl font-black">Equilibre o jogo em segundos</h2><p className="mt-3 text-sm leading-relaxed text-ink/50">Vamos priorizar goleiros, ordenar por nível e distribuir em serpentina. Só entram times completos; quem sobrar continua como reserva.</p><div className="mx-auto mt-6 flex max-w-sm items-center justify-center gap-5 rounded-2xl bg-ink/[.035] p-4"><div><b className="text-xl">{available.length}</b><p className="text-[11px] text-ink/40">disponíveis</p></div><div className="h-8 w-px bg-ink/10" /><div><b className="text-xl">{possible}</b><p className="text-[11px] text-ink/40">times</p></div><div className="h-8 w-px bg-ink/10" /><div><b className="text-xl">{reserves}</b><p className="text-[11px] text-ink/40">reservas</p></div></div><button onClick={draw} disabled={possible < 2 || drawLocked} className="btn-lime mt-7 min-w-48"><Sparkles size={18} /> Sortear agora</button>{possible < 2 && <p className="mt-3 text-xs font-semibold text-orange">São necessários pelo menos {teamSize * 2} presentes.</p>}</div></div> : <><div className="mt-5 flex items-center justify-between"><div><p className="font-extrabold">Prévia dos times</p><p className="text-xs text-ink/45">{drawLocked ? 'Times confirmados para a sessão de hoje.' : 'Toque nas setas para fazer um ajuste rápido.'}</p></div>{!drawLocked && <button onClick={draw} className="btn-soft"><RotateCcw size={16} /> Refazer</button>}</div><div className="mt-4 grid gap-4 lg:grid-cols-2 xl:grid-cols-3">{teams.map((team, ti) => <div key={team.id} className="panel overflow-hidden"><div className="flex items-center justify-between p-4 text-white" style={{ background: ti < 2 ? '#0D1B2A' : '#1B3A5C' }}><div className="flex items-center gap-2"><span className="grid h-9 w-9 place-items-center rounded-xl text-sm font-black text-ink" style={{ background: teamColors[ti % teamColors.length] }}>{team.numero}</span><div><p className="text-sm font-extrabold">Time {team.numero}</p><p className="text-[10px] text-white/45">{team.jogadores.reduce((n,p) => n + p.estrelas, 0)} estrelas no total</p></div></div><span className="chip bg-white/10 text-white/70">{ti < 2 ? 'Joga agora' : `${ti + 1}º na fila`}</span></div><div className="divide-y divide-ink/7">{team.jogadores.map((p) => <div key={p.id} className="flex items-center gap-3 p-3.5"><Avatar player={p} size="sm" ring={p.posicao === 'goleiro' ? teamColors[ti % teamColors.length] : undefined} /><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{p.nome}</p><div className="flex items-center gap-2"><span className="text-[10px] text-ink/40">{positionLabel[p.posicao]}</span><Stars value={p.estrelas} /></div></div>{!drawLocked && <button onClick={() => swap(ti, p)} className="rounded-lg p-2 text-ink/25 hover:bg-ink/5 hover:text-ink" title="Trocar com próximo time"><ArrowLeftRight size={16} /></button>}</div>)}</div></div>)}</div>{!drawLocked && <div className="sticky bottom-4 mt-6 flex justify-end"><button onClick={confirm} className="btn-lime shadow-xl"><Check size={18} /> Confirmar times e iniciar</button></div>}</>}
   </div>
 }
 
