@@ -67,6 +67,8 @@ function App() {
   const [teams, setTeams] = useState<Time[]>([])
   const [events, setEvents] = useState<GolEvento[]>([])
   const [match, setMatch] = useState<Match | null>(null)
+  const [sessionMatches, setSessionMatches] = useState<PartidaHistorica[]>([])
+  const [pendingDrawMatch, setPendingDrawMatch] = useState<Match | null>(null)
   const [sessionId, setSessionId] = useState('demo-session')
   const [status, setStatus] = useState<SessionStatus>('aguardando_checkin')
   const [teamSize, setTeamSize] = useState(6)
@@ -103,6 +105,25 @@ function App() {
 
   useEffect(() => { void refreshPapel() }, [userId])
 
+  const loadSessionMatches = async (targetSessionId: string) => {
+    if (!supabase) return
+    const { data, error } = await supabase.from('partidas').select(`
+      id, placar_a, placar_b, horario_inicio,
+      time_a:times!partidas_time_a_id_fkey(id, numero, forca_media, times_jogadores(participantes(nome))),
+      time_b:times!partidas_time_b_id_fkey(id, numero, forca_media, times_jogadores(participantes(nome)))
+    `).eq('sessao_id', targetSessionId).eq('status', 'finalizada').order('horario_inicio')
+    if (!error) setSessionMatches((data ?? []) as unknown as PartidaHistorica[])
+  }
+
+  const reloadPendingDraw = async (targetSessionId: string) => {
+    if (!supabase) return
+    const { data: sessionRow } = await supabase.from('sessoes').select('pendente_escolha_partida_id').eq('id', targetSessionId).maybeSingle()
+    const pendingId = sessionRow?.pendente_escolha_partida_id ?? null
+    if (!pendingId) { setPendingDrawMatch(null); return }
+    const { data: partidaRow } = await supabase.from('partidas').select('*').eq('id', pendingId).maybeSingle()
+    setPendingDrawMatch((partidaRow as Match | null) ?? null)
+  }
+
   const startNewSession = async () => {
     if (!supabase || papel !== 'admin') return false
     const created = await supabase.from('sessoes').insert({ data: format(new Date(), 'yyyy-MM-dd'), tamanho_time: 6, duracao_partida_minutos: 10 }).select().single()
@@ -117,6 +138,8 @@ function App() {
     setCheckins([])
     setMatch(null)
     setEvents([])
+    setSessionMatches([])
+    setPendingDrawMatch(null)
     return true
   }
 
@@ -134,7 +157,7 @@ function App() {
         return
       }
       if (!sessionData) {
-        setSessionReady(false); setSessionId(''); setTeams([]); setMatch(null); setEvents([])
+        setSessionReady(false); setSessionId(''); setTeams([]); setMatch(null); setEvents([]); setSessionMatches([]); setPendingDrawMatch(null)
         return
       }
       setSessionReady(true); setSessionId(sessionData.id); setStatus(sessionData.status); setTeamSize(sessionData.tamanho_time); setDuration(sessionData.duracao_partida_minutos)
@@ -146,6 +169,11 @@ function App() {
       setMatch((matchData as Match | null) ?? null)
       if (matchData) { const { data: ev } = await db.from('eventos').select('*').eq('partida_id', matchData.id).order('criado_em'); setEvents((ev ?? []) as GolEvento[]) }
       else setEvents([])
+      await loadSessionMatches(sessionData.id)
+      if (sessionData.pendente_escolha_partida_id) {
+        const { data: pendingData } = await db.from('partidas').select('*').eq('id', sessionData.pendente_escolha_partida_id).maybeSingle()
+        setPendingDrawMatch((pendingData as Match | null) ?? null)
+      } else setPendingDrawMatch(null)
     }
     load().catch(() => toast.error('Não foi possível carregar a sessão.'))
   }, [authEmail, papel])
@@ -157,15 +185,23 @@ function App() {
       const { data } = await db.from('times').select('*, times_jogadores(participantes(*))').eq('sessao_id', sessionId).order('posicao_fila')
       if (data) setTeams(data.map((t) => ({ ...t, jogadores: t.times_jogadores.map((j: { participantes: Participante }) => j.participantes) })) as Time[])
     }
+    const reloadMatch = async () => {
+      const { data: matchData } = await db.from('partidas').select('*').eq('sessao_id', sessionId).eq('status', 'em_andamento').maybeSingle()
+      setMatch((matchData as Match | null) ?? null)
+      if (matchData) {
+        const { data: ev } = await db.from('eventos').select('*').eq('partida_id', matchData.id).order('criado_em')
+        setEvents((ev ?? []) as GolEvento[])
+      } else setEvents([])
+    }
     let channel = db.channel(`sessao:${sessionId}:${match?.id ?? 'sem-partida'}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'partidas', filter: `sessao_id=eq.${sessionId}` }, ({ new: next }) => {
         if (!next) return
         const incoming = next as Match
         if (incoming.status === 'em_andamento') {
           setMatch((old) => { if (old?.id !== incoming.id) setEvents([]); return incoming })
-        } else setMatch((old) => old?.id === incoming.id ? null : old)
+        } else { setMatch((old) => old?.id === incoming.id ? null : old); void loadSessionMatches(sessionId); void reloadPendingDraw(sessionId) }
       })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'times', filter: `sessao_id=eq.${sessionId}` }, reloadTeams)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'times', filter: `sessao_id=eq.${sessionId}` }, () => { void reloadTeams(); void reloadPendingDraw(sessionId) })
     if (match?.id) {
       channel = channel.on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'eventos', filter: `partida_id=eq.${match.id}` }, ({ new: next }) => {
         const incoming = next as GolEvento
@@ -173,7 +209,9 @@ function App() {
         setEvents((old) => old.some((event) => event.id === incoming.id) ? old : [...old, incoming])
       })
     }
-    channel.subscribe()
+    channel.subscribe((subStatus) => {
+      if (subStatus === 'SUBSCRIBED') { void reloadTeams(); void reloadMatch(); void loadSessionMatches(sessionId); void reloadPendingDraw(sessionId) }
+    })
     return () => { db.removeChannel(channel) }
   }, [sessionId, sessionReady, match?.id, papel])
 
@@ -208,13 +246,13 @@ function App() {
     {mobileMenu && <button className="fixed inset-0 z-30 bg-ink/50 md:hidden" onClick={() => setMobileMenu(false)} aria-label="Fechar menu" />}
 
     <main className="min-w-0 flex-1">
-      <header className="flex h-20 items-center justify-between border-b border-ink/8 px-4 md:px-8"><div className="flex items-center gap-3"><button className="rounded-xl bg-white p-2.5 shadow-sm md:hidden" onClick={() => setMobileMenu(true)} aria-label="Abrir menu"><Menu size={20} /></button>{view !== 'inicio' && <div><p className="text-[11px] font-extrabold uppercase tracking-[.15em] text-turf-600">Pelada de domingo</p><h1 className="text-lg font-extrabold md:text-xl">{pageTitle[view]}</h1></div>}</div><div className="hidden items-center gap-3 sm:flex"><span className={`chip ${hasSupabase ? 'bg-turf-100 text-turf-700' : 'bg-amber-100 text-amber-800'}`}>{hasSupabase ? <><span className="h-1.5 w-1.5 rounded-full bg-turf-500" /> Sincronizado</> : 'Modo demo'}</span>{papel === 'admin' && <button onClick={() => setShowSettings(true)} className="btn-soft !min-h-10 !px-3" aria-label="Configurações"><Settings2 size={18} /></button>}</div></header>
+      <header className="flex h-20 items-center justify-between border-b border-ink/8 px-4 md:px-8"><div className="flex items-center gap-3"><button className="rounded-xl bg-white p-2.5 shadow-sm md:hidden" onClick={() => setMobileMenu(true)} aria-label="Abrir menu"><Menu size={20} /></button>{view !== 'inicio' && <div><p className="text-[11px] font-extrabold uppercase tracking-[.15em] text-turf-600">Pelada de domingo</p><h1 className="text-lg font-extrabold md:text-xl">{pageTitle[view]}</h1></div>}</div><div className="hidden items-center gap-3 sm:flex"><span className={`chip ${hasSupabase ? 'bg-turf-100 text-turf-700' : 'bg-amber-100 text-amber-800'}`}>{hasSupabase ? <><span className="h-1.5 w-1.5 rounded-full bg-turf-500" /> Sincronizado</> : 'Modo demo'}</span></div></header>
       <div className="mx-auto max-w-[1440px] p-4 pb-24 md:p-8">
         {view === 'inicio' && <Dashboard players={players} checkins={checkins} teams={teams} match={match} setView={setView} />}
         {view === 'participantes' && <Participants players={players} setPlayers={setPlayers} papel={papel} userId={userId} />}
         {view === 'checkin' && <Checkin players={players} checkins={checkins} setCheckins={setCheckins} sessionId={sessionId} teamSize={teamSize} />}
         {view === 'sorteio' && <Draw players={players} checkins={checkins} setCheckins={setCheckins} teams={teams} setTeams={setTeams} teamSize={teamSize} setTeamSize={setTeamSize} sessionId={sessionId} setStatus={setStatus} status={status} goLive={() => setView('partida')} />}
-        {view === 'partida' && (!sessionReady ? <WaitingSession /> : <LiveMatch readOnly={papel === 'normal'} teams={teams} setTeams={setTeams} players={players} match={match} setMatch={setMatch} events={events} setEvents={setEvents} sessionId={sessionId} duration={duration} status={status} onSessionFinished={() => { setStatus('finalizada'); setView('historico'); void startNewSession() }} onOpenDurationSettings={() => setShowSettings(true)} />)}
+        {view === 'partida' && (!sessionReady ? <WaitingSession /> : <LiveMatch readOnly={papel === 'normal'} teams={teams} setTeams={setTeams} players={players} match={match} setMatch={setMatch} events={events} setEvents={setEvents} sessionId={sessionId} duration={duration} status={status} sessionMatches={sessionMatches} pendingDrawMatch={pendingDrawMatch} setPendingDrawMatch={setPendingDrawMatch} onSessionFinished={() => { setStatus('finalizada'); setView('historico'); void startNewSession() }} onOpenDurationSettings={() => setShowSettings(true)} />)}
         {view === 'estatisticas' && <Stats players={players} events={events} />}
         {view === 'historico' && <HistoryPage players={players} events={events} />}
         {view === 'aprovacoes' && papel === 'admin' && <Approvals />}
@@ -490,18 +528,82 @@ function Draw({ players, checkins, setCheckins, teams, setTeams, teamSize, setTe
   </div>
 }
 
-function LiveMatch({ readOnly, teams, setTeams, players, match, setMatch, events, setEvents, sessionId, duration, status, onSessionFinished, onOpenDurationSettings }: { readOnly: boolean; teams: Time[]; setTeams: React.Dispatch<React.SetStateAction<Time[]>>; players: Participante[]; match: Match | null; setMatch: React.Dispatch<React.SetStateAction<Match | null>>; events: GolEvento[]; setEvents: React.Dispatch<React.SetStateAction<GolEvento[]>>; sessionId: string; duration: number; status: SessionStatus; onSessionFinished: () => void; onOpenDurationSettings: () => void }) {
+function LiveMatch({ readOnly, teams, setTeams, players, match, setMatch, events, setEvents, sessionId, duration, status, sessionMatches, pendingDrawMatch, setPendingDrawMatch, onSessionFinished, onOpenDurationSettings }: { readOnly: boolean; teams: Time[]; setTeams: React.Dispatch<React.SetStateAction<Time[]>>; players: Participante[]; match: Match | null; setMatch: React.Dispatch<React.SetStateAction<Match | null>>; events: GolEvento[]; setEvents: React.Dispatch<React.SetStateAction<GolEvento[]>>; sessionId: string; duration: number; status: SessionStatus; sessionMatches: PartidaHistorica[]; pendingDrawMatch: Match | null; setPendingDrawMatch: React.Dispatch<React.SetStateAction<Match | null>>; onSessionFinished: () => void; onOpenDurationSettings: () => void }) {
   const playing = teams.filter((t) => t.posicao_fila <= 2).sort((a,b) => a.posicao_fila - b.posicao_fila); const [seconds, setSeconds] = useState(duration * 60); const [assistFor, setAssistFor] = useState<{ player: Participante; team: Time; event: GolEvento } | null>(null); const [confirmEnd, setConfirmEnd] = useState(false)
   const [endSessionStep, setEndSessionStep] = useState<0 | 1 | 2>(0)
   const [endingSession, setEndingSession] = useState(false)
+  const [finishing, setFinishing] = useState(false)
+  const [awaitingDrawChoice, setAwaitingDrawChoice] = useState(false)
+  const [drawChoice, setDrawChoice] = useState<string[]>([])
   useEffect(() => { if (!match) { setSeconds(duration * 60); return } const calc = () => { const elapsed = match.timer_running && match.timer_started_at ? Math.floor((Date.now() - +new Date(match.timer_started_at)) / 1000) : 0; setSeconds(Math.max(0, match.timer_remaining_seconds - elapsed)) }; calc(); const id = setInterval(calc, 500); return () => clearInterval(id) }, [match, duration])
   const patchMatch = async (patch: Partial<Match>) => { if (readOnly) return; const previous = match; setMatch((old) => old ? { ...old, ...patch } : old); if (supabase && match) { const { error } = await supabase.from('partidas').update(patch).eq('id', match.id); if (error) { setMatch(previous); toast.error(error.message) } } }
   const start = async () => { if (readOnly) return; if (playing.length < 2) return toast.error('Confirme ao menos dois times no sorteio.'); if (!match) { const item: Match = { id: uid(), time_a_id: playing[0].id, time_b_id: playing[1].id, placar_a: 0, placar_b: 0, status: 'em_andamento', horario_inicio: new Date().toISOString(), timer_started_at: new Date().toISOString(), timer_remaining_seconds: duration * 60, timer_running: true }; if (supabase) { const { data, error } = await supabase.from('partidas').insert({ sessao_id: sessionId, time_a_id: item.time_a_id, time_b_id: item.time_b_id, horario_inicio: item.horario_inicio, timer_started_at: item.timer_started_at, timer_remaining_seconds: item.timer_remaining_seconds, timer_running: true }).select().single(); if (error) return toast.error(error.message); setMatch(data as Match) } else setMatch(item); toast.success('Partida iniciada!') } else if (!match.timer_running) patchMatch({ timer_running: true, timer_started_at: new Date().toISOString(), timer_remaining_seconds: seconds }) }
   const pause = () => { if (!readOnly) patchMatch({ timer_running: false, timer_started_at: null, timer_remaining_seconds: seconds }) }
   const reset = () => { if (readOnly) return; setSeconds(duration * 60); patchMatch({ timer_running: false, timer_started_at: null, timer_remaining_seconds: duration * 60 }) }
-  const goal = async (player: Participante, team: Time) => { if (readOnly) return; if (!match) return toast.error('Inicie a partida antes de marcar gols.'); const side = match.time_a_id === team.id ? 'placar_a' : 'placar_b'; const ev: GolEvento = { id: uid(), partida_id: match.id, jogador_id: player.id, assistente_id: null, time_id: team.id, criado_em: new Date().toISOString() }; const next = { [side]: match[side] + 1 }; await patchMatch(next); if (supabase) { const { data, error } = await supabase.from('eventos').insert({ partida_id: match.id, jogador_id: player.id, time_id: team.id }).select().single(); if (error) return toast.error(error.message); setEvents((old) => [...old, data as GolEvento]); setAssistFor({ player, team, event: data as GolEvento }) } else { setEvents((old) => [...old, ev]); setAssistFor({ player, team, event: ev }) }; toast.success(`Gol de ${player.nome}! ⚽`) }
+
+  const computeAutomaticRotation = (alvo: Match): Time[] => {
+    const queue = [...teams].sort((a,b) => a.posicao_fila - b.posicao_fila)
+    const aWon = alvo.placar_a > alvo.placar_b
+    const bWon = alvo.placar_b > alvo.placar_a
+    let next: Time[]
+    if (aWon || bWon) {
+      const winner = aWon ? playing[0] : playing[1]
+      const loser = aWon ? playing[1] : playing[0]
+      const waiting = queue.filter((t) => !playing.some((p) => p.id === t.id))
+      next = [winner, ...waiting, loser]
+    } else {
+      const waiting = queue.filter((t) => !playing.some((p) => p.id === t.id))
+      next = [...waiting, playing[0], playing[1]]
+    }
+    return next.map((t, i) => ({ ...t, posicao_fila: i + 1, status: i < 2 ? 'jogando' as const : 'na_fila' as const }))
+  }
+  const computeManualDrawRotation = (alvo: Match, escolhaA: string, escolhaB: string): Time[] => {
+    const queue = [...teams].sort((a,b) => a.posicao_fila - b.posicao_fila)
+    const chosen = queue.filter((t) => t.id === escolhaA || t.id === escolhaB)
+    const relegados = queue.filter((t) => (t.id === alvo.time_a_id || t.id === alvo.time_b_id) && t.id !== escolhaA && t.id !== escolhaB)
+    const resto = queue.filter((t) => t.id !== escolhaA && t.id !== escolhaB && t.id !== alvo.time_a_id && t.id !== alvo.time_b_id)
+    const next = [...chosen, ...resto, ...relegados]
+    return next.map((t, i) => ({ ...t, posicao_fila: i + 1, status: i < 2 ? 'jogando' as const : 'na_fila' as const }))
+  }
+  const finalizarPartida = async (alvo: Match, proximo?: [string, string]) => {
+    if (readOnly || finishing) return
+    setFinishing(true)
+    if (supabase) {
+      const { error } = await supabase.rpc('finalizar_partida_e_girar_fila', { p_partida_id: alvo.id, p_proximo_time_a_id: proximo?.[0] ?? null, p_proximo_time_b_id: proximo?.[1] ?? null })
+      if (error) { setFinishing(false); toast.error(error.message); return }
+      const { data } = await supabase.from('times').select('*, times_jogadores(participantes(*))').eq('sessao_id', sessionId).order('posicao_fila')
+      if (data) setTeams(data.map((t) => ({ ...t, jogadores: t.times_jogadores.map((j: { participantes: Participante }) => j.participantes) })) as Time[])
+    } else {
+      setTeams(proximo ? computeManualDrawRotation(alvo, proximo[0], proximo[1]) : computeAutomaticRotation(alvo))
+    }
+    setFinishing(false)
+    setMatch(null)
+    setPendingDrawMatch(null)
+    setConfirmEnd(false)
+    setAwaitingDrawChoice(false)
+    setDrawChoice([])
+    setSeconds(duration * 60)
+    toast.success('Partida encerrada. Próximos times em campo!')
+  }
+  const attemptFinish = (alvo: Match) => {
+    if (readOnly || playing.length < 2 || finishing) return
+    if (alvo.placar_a === alvo.placar_b && teams.length >= 3) {
+      setDrawChoice([])
+      setAwaitingDrawChoice(true)
+      setConfirmEnd(false)
+      return
+    }
+    void finalizarPartida(alvo)
+  }
+  const drawTarget = match ?? pendingDrawMatch
+  useEffect(() => { if (pendingDrawMatch && !match) { setDrawChoice([]); setAwaitingDrawChoice(true) } }, [pendingDrawMatch, match])
+  const eligibleForDrawChoice = drawTarget ? (teams.length === 3 ? teams : teams.filter((t) => t.id !== drawTarget.time_a_id && t.id !== drawTarget.time_b_id)) : []
+  const toggleDrawChoice = (teamId: string) => { setDrawChoice((old) => old.includes(teamId) ? old.filter((id) => id !== teamId) : old.length >= 2 ? old : [...old, teamId]) }
+  const drawChoiceValid = drawChoice.length === 2 && !(drawTarget && drawChoice.includes(drawTarget.time_a_id) && drawChoice.includes(drawTarget.time_b_id))
+  const confirmDrawChoice = () => { if (drawTarget && drawChoiceValid) void finalizarPartida(drawTarget, [drawChoice[0], drawChoice[1]]) }
+  const goal = async (player: Participante, team: Time) => { if (readOnly) return; if (!match) return toast.error('Inicie a partida antes de marcar gols.'); const side = match.time_a_id === team.id ? 'placar_a' : 'placar_b'; const novoPlacar = match[side] + 1; const ev: GolEvento = { id: uid(), partida_id: match.id, jogador_id: player.id, assistente_id: null, time_id: team.id, criado_em: new Date().toISOString() }; const next = { [side]: novoPlacar }; await patchMatch(next); if (supabase) { const { data, error } = await supabase.from('eventos').insert({ partida_id: match.id, jogador_id: player.id, time_id: team.id }).select().single(); if (error) return toast.error(error.message); setEvents((old) => [...old, data as GolEvento]); setAssistFor({ player, team, event: data as GolEvento }) } else { setEvents((old) => [...old, ev]); setAssistFor({ player, team, event: ev }) }; toast.success(`Gol de ${player.nome}! ⚽`); if (novoPlacar >= 2) void finalizarPartida({ ...match, ...next }) }
   const assist = async (p: Participante | null) => { if (readOnly || !assistFor) return; if (p) { setEvents((old) => old.map((e) => e.id === assistFor.event.id ? { ...e, assistente_id: p.id } : e)); if (supabase) await supabase.from('eventos').update({ assistente_id: p.id }).eq('id', assistFor.event.id); toast.success(`Assistência de ${p.nome}`) } setAssistFor(null) }
-  const finish = async () => { if (readOnly || !match || playing.length < 2) return; const queue = [...teams].sort((a,b) => a.posicao_fila - b.posicao_fila); const aWon = match.placar_a > match.placar_b; const bWon = match.placar_b > match.placar_a; let next: Time[]; if (aWon || bWon) { const winner = aWon ? playing[0] : playing[1]; const loser = aWon ? playing[1] : playing[0]; const waiting = queue.filter((t) => !playing.some((p) => p.id === t.id)); next = [winner, ...waiting, loser] } else { const waiting = queue.filter((t) => !playing.some((p) => p.id === t.id)); next = [...waiting, playing[0], playing[1]] } next = next.map((t, i) => ({ ...t, posicao_fila: i + 1, status: i < 2 ? 'jogando' : 'na_fila' })); if (supabase) { const { error } = await supabase.rpc('finalizar_partida_e_girar_fila', { p_partida_id: match.id }); if (error) return toast.error(error.message) } setTeams(next); setMatch(null); setConfirmEnd(false); setSeconds(duration * 60); toast.success('Partida encerrada. Próximos times em campo!') }
+  useEffect(() => { if (readOnly || !match || !match.timer_running || seconds > 0 || finishing || awaitingDrawChoice) return; attemptFinish(match) }, [seconds])
   const finishSession = async () => {
     if (readOnly || endingSession) return
     setEndingSession(true)
@@ -519,12 +621,14 @@ function LiveMatch({ readOnly, teams, setTeams, players, match, setMatch, events
     toast.success('Sessão finalizada e salva!')
   }
   if (teams.length < 2) return <EmptyState icon={Shirt} title="Ainda não há dois times" text={readOnly ? 'Aguardando o organizador formar e confirmar os times.' : 'Vá até Sorteio, forme e confirme os times para abrir a partida ao vivo.'} />
-  const displayTeams = match ? [teams.find((t) => t.id === match.time_a_id), teams.find((t) => t.id === match.time_b_id)].filter(Boolean) as Time[] : playing
-  return <div>{readOnly && <div className="mb-4 flex items-center gap-2 rounded-2xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm font-semibold text-blue-800"><Shield size={17} /> Você está acompanhando esta partida em modo somente leitura.</div>}<div className="mb-5 grid gap-4 xl:grid-cols-[1fr_auto_1fr]"><TeamScore team={displayTeams[0]} score={match?.placar_a ?? 0} color={teamColors[0]} align="left" /><div className="panel flex min-w-64 flex-col items-center justify-center px-6 py-4"><span className={`chip ${match?.timer_running ? 'bg-red-100 text-red-700' : 'bg-ink/5 text-ink/50'}`}>{match?.timer_running && <span className="live-dot h-1.5 w-1.5 rounded-full bg-red-500" />}{match ? (match.timer_running ? 'AO VIVO' : 'PAUSADO') : 'PRONTO'}</span><p className={`mt-2 font-mono text-5xl font-black tracking-tight ${seconds === 0 ? 'text-red-600' : ''}`}>{String(Math.floor(seconds / 60)).padStart(2,'0')}:{String(seconds % 60).padStart(2,'0')}</p>{!readOnly && <><div className="mt-3 flex gap-2">{!match?.timer_running ? <button onClick={start} className="btn-lime !min-h-10"><Play size={16} fill="currentColor" /> {match ? 'Retomar' : 'Iniciar'}</button> : <button onClick={pause} className="btn-soft !min-h-10"><Pause size={16} fill="currentColor" /> Pausar</button>}<button onClick={reset} className="btn-soft !min-h-10 !px-3" title="Zerar cronômetro"><TimerReset size={17} /></button><button onClick={onOpenDurationSettings} className="btn-soft !min-h-10 !px-3" title="Ajustar duração da partida"><Settings2 size={17} /></button></div>{seconds === 0 && <button onClick={() => setConfirmEnd(true)} className="mt-3 text-xs font-bold text-red-600">Tempo esgotado · encerrar?</button>}</>}</div><TeamScore team={displayTeams[1]} score={match?.placar_b ?? 0} color={teamColors[1]} align="right" /></div>
+  const displayTeams = drawTarget ? [teams.find((t) => t.id === drawTarget.time_a_id), teams.find((t) => t.id === drawTarget.time_b_id)].filter(Boolean) as Time[] : playing
+  return <div>{readOnly && <div className="mb-4 flex items-center gap-2 rounded-2xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm font-semibold text-blue-800"><Shield size={17} /> Você está acompanhando esta partida em modo somente leitura.</div>}<div className="mb-5 grid gap-4 xl:grid-cols-[1fr_auto_1fr]"><TeamScore team={displayTeams[0]} score={drawTarget?.placar_a ?? 0} color={teamColors[0]} align="left" /><div className="panel flex min-w-64 flex-col items-center justify-center px-6 py-4"><span className={`chip ${awaitingDrawChoice ? 'bg-amber-100 text-amber-800' : match?.timer_running ? 'bg-red-100 text-red-700' : 'bg-ink/5 text-ink/50'}`}>{match?.timer_running && !awaitingDrawChoice && <span className="live-dot h-1.5 w-1.5 rounded-full bg-red-500" />}{awaitingDrawChoice ? 'EMPATE · ESCOLHA A SEGUIR' : match ? (match.timer_running ? 'AO VIVO' : 'PAUSADO') : 'PRONTO'}</span><p className={`mt-2 font-mono text-5xl font-black tracking-tight ${seconds === 0 ? 'text-red-600' : ''}`}>{String(Math.floor(seconds / 60)).padStart(2,'0')}:{String(seconds % 60).padStart(2,'0')}</p>{!readOnly && !awaitingDrawChoice && <div className="mt-3 flex gap-2">{!match?.timer_running ? <button onClick={start} className="btn-lime !min-h-10"><Play size={16} fill="currentColor" /> {match ? 'Retomar' : 'Iniciar'}</button> : <button onClick={pause} className="btn-soft !min-h-10"><Pause size={16} fill="currentColor" /> Pausar</button>}<button onClick={reset} className="btn-soft !min-h-10 !px-3" title="Zerar cronômetro"><TimerReset size={17} /></button><button onClick={onOpenDurationSettings} className="btn-soft !min-h-10 !px-3" title="Ajustar duração da partida"><Settings2 size={17} /></button></div>}</div><TeamScore team={displayTeams[1]} score={drawTarget?.placar_b ?? 0} color={teamColors[1]} align="right" /></div>
     <div className="grid gap-5 xl:grid-cols-[1fr_310px]"><div className="field-grid field-lines relative min-h-[500px] overflow-hidden rounded-[28px] border-[6px] border-white shadow-card"><div className="pointer-events-none absolute left-1/2 top-1/2 h-28 w-28 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/55" /><div className="relative z-10 grid min-h-[500px] grid-cols-2 gap-4 p-3 sm:gap-6 sm:p-5 md:gap-12 md:p-10">{displayTeams.map((team, ti) => <div key={team.id} className="grid content-around gap-4">{team.jogadores.map((p, pi) => <button key={p.id} disabled={readOnly} onClick={() => goal(p, team)} className={`group mx-auto flex w-20 flex-col items-center sm:w-24 ${readOnly ? 'cursor-default' : ''} ${pi % 2 && team.jogadores.length > 4 ? (ti ? 'md:translate-x-12' : 'md:-translate-x-12') : ''}`}><div className="relative"><Avatar player={p} size="lg" ring={teamColors[ti]} />{!readOnly && <span className="absolute -bottom-1 -right-1 grid h-7 w-7 place-items-center rounded-full bg-white text-base shadow-md transition group-active:scale-125">⚽</span>}</div><span className="mt-2 max-w-20 truncate rounded-full bg-ink/80 px-2 py-1 text-[10px] font-bold text-white backdrop-blur sm:max-w-24">{p.apelido || p.nome.split(' ')[0]}</span></button>)}</div>)}</div></div>
       <aside className="space-y-4"><div className="panel p-5"><div className="flex items-center justify-between"><p className="font-extrabold">Próximos na fila</p><span className="chip bg-ink/5 text-ink/50">{teams.filter((t) => t.posicao_fila > 2).length}</span></div><div className="mt-4 space-y-2">{teams.filter((t) => t.posicao_fila > 2).sort((a,b) => a.posicao_fila-b.posicao_fila).map((t, i) => <div key={t.id} className="flex items-center gap-3 rounded-xl bg-ink/[.035] p-3"><span className="grid h-8 w-8 place-items-center rounded-lg font-black text-ink" style={{ background: teamColors[(i+2)%teamColors.length] }}>{t.posicao_fila}</span><div className="flex-1"><p className="text-sm font-bold">Time {t.numero}</p><p className="text-[10px] text-ink/40">{t.jogadores.length} jogadores</p></div>{i === 0 && <span className="text-[10px] font-extrabold text-turf-600">A SEGUIR</span>}</div>)}{teams.length <= 2 && <p className="py-5 text-center text-xs text-ink/35">Sem times na espera.</p>}</div></div><div className="panel p-5"><div className="flex items-center justify-between"><p className="font-extrabold">Últimos gols</p><History size={16} className="text-ink/30" /></div><div className="mt-4 space-y-3">{events.slice(-4).reverse().map((e) => { const p = players.find((x) => x.id === e.jogador_id); const a = players.find((x) => x.id === e.assistente_id); return p && <div key={e.id} className="flex gap-3"><span className="grid h-8 w-8 place-items-center rounded-full bg-turf-100">⚽</span><div><p className="text-xs font-bold">{p.nome}</p><p className="text-[10px] text-ink/40">{a ? `Assistência: ${a.nome}` : 'Sem assistência'} · {format(new Date(e.criado_em), 'HH:mm')}</p></div></div>})}{!events.length && <p className="py-4 text-center text-xs text-ink/35">O primeiro gol aparece aqui.</p>}</div></div>{!readOnly && <button disabled={!match} onClick={() => setConfirmEnd(true)} className="btn-primary w-full">Encerrar partida</button>}</aside></div>
+    {sessionMatches.length > 0 && <section className="mt-8"><div className="mb-4 flex items-center justify-between"><div><p className="text-xl font-black">Partidas de hoje</p><p className="mt-1 text-sm text-ink/45">Placares já fechados nesta sessão, sem sair desta tela.</p></div><span className="chip bg-ink/5 text-ink/50">{sessionMatches.length}</span></div><div className="space-y-3">{[...sessionMatches].reverse().map((m, i) => <MatchResultCard key={m.id} match={m} label={`Partida ${sessionMatches.length - i} · ${format(new Date(m.horario_inicio), 'HH:mm')}`} />)}</div></section>}
     {!readOnly && assistFor && <Modal title="Foi golaço! ⚽" onClose={() => setAssistFor(null)}><p className="text-sm text-ink/55"><b className="text-ink">{assistFor.player.nome}</b> marcou. Alguém deu a assistência?</p><div className="mt-4 max-h-72 space-y-2 overflow-auto">{assistFor.team.jogadores.filter((p) => p.id !== assistFor.player.id).map((p) => <button key={p.id} onClick={() => assist(p)} className="flex w-full items-center gap-3 rounded-xl border border-ink/8 p-3 text-left hover:bg-turf-50"><Avatar player={p} size="sm" /><span className="text-sm font-bold">{p.nome}</span><ChevronRight className="ml-auto text-ink/25" size={16} /></button>)}</div><button onClick={() => assist(null)} className="btn-soft mt-3 w-full">Sem assistência</button></Modal>}
-    {!readOnly && confirmEnd && <Modal title="Encerrar a partida?" onClose={() => setConfirmEnd(false)}><p className="text-sm leading-relaxed text-ink/55">O placar final será <b className="text-ink">{match?.placar_a ?? 0} × {match?.placar_b ?? 0}</b>. A fila será atualizada automaticamente conforme o resultado.</p><div className="mt-6 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end"><button onClick={() => setConfirmEnd(false)} className="btn-soft w-full sm:w-auto">Continuar jogando</button><button onClick={finish} className="btn-primary w-full sm:w-auto">Confirmar encerramento</button></div></Modal>}
+    {!readOnly && confirmEnd && <Modal title="Encerrar a partida?" onClose={() => setConfirmEnd(false)}><p className="text-sm leading-relaxed text-ink/55">O placar final será <b className="text-ink">{match?.placar_a ?? 0} × {match?.placar_b ?? 0}</b>. Se não for empate, a fila é atualizada automaticamente; em caso de empate com 3 times ou mais, você escolhe o próximo confronto.</p><div className="mt-6 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end"><button onClick={() => setConfirmEnd(false)} className="btn-soft w-full sm:w-auto">Continuar jogando</button><button onClick={() => match && attemptFinish(match)} className="btn-primary w-full sm:w-auto">Confirmar encerramento</button></div></Modal>}
+    {!readOnly && awaitingDrawChoice && drawTarget && <Modal title="Empate — escolha o próximo confronto" onClose={() => { if (match) setAwaitingDrawChoice(false) }}><p className="text-sm leading-relaxed text-ink/55">Placar final <b className="text-ink">{drawTarget.placar_a} × {drawTarget.placar_b}</b>. {teams.length === 3 ? 'Escolha quem joga com o time que estava de fora.' : 'Os dois times que empataram foram para o fim da fila — escolha dois times entre quem estava esperando.'}{!match && <> A partida já havia terminado sozinha — escolha pra liberar a fila.</>}</p><div className="mt-4 max-h-72 space-y-2 overflow-auto">{eligibleForDrawChoice.map((t) => { const selected = drawChoice.includes(t.id); const disabled = !selected && drawChoice.length >= 2; return <button key={t.id} disabled={disabled} onClick={() => toggleDrawChoice(t.id)} className={`flex w-full items-center gap-3 rounded-xl border p-3 text-left transition disabled:cursor-not-allowed disabled:opacity-40 ${selected ? 'border-turf-500 bg-turf-50' : 'border-ink/8 hover:bg-ink/[.02]'}`}><span className="grid h-9 w-9 place-items-center rounded-lg text-sm font-black text-ink" style={{ background: teamColors[(t.numero - 1) % teamColors.length] }}>{t.numero}</span><span className="flex-1 text-sm font-bold">Time {t.numero}</span>{selected && <Check size={17} className="text-turf-600" />}</button> })}</div><button disabled={!drawChoiceValid} onClick={confirmDrawChoice} className="btn-lime mt-4 w-full disabled:cursor-not-allowed disabled:opacity-50"><Check size={17} /> Confirmar próximo confronto</button></Modal>}
     {!readOnly && <div className="mt-12 flex justify-center border-t border-dashed border-ink/10 pt-6">{status === 'finalizada' ? <span className="chip bg-ink/5 text-ink/40">Sessão encerrada</span> : <button onClick={() => setEndSessionStep(1)} className="text-xs font-semibold text-ink/35 underline decoration-dotted underline-offset-4 transition hover:text-ink/60">Finalizar sessão de hoje (encerra a pelada inteira)</button>}</div>}
     {!readOnly && endSessionStep === 1 && <Modal title="Finalizar a sessão de hoje?" onClose={() => setEndSessionStep(0)}><p className="text-sm leading-relaxed text-ink/55">Isso encerra a pelada de hoje. Nenhuma partida poderá ser iniciada depois disso.</p><div className="mt-6 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end"><button onClick={() => setEndSessionStep(0)} className="btn-soft w-full sm:w-auto">Cancelar</button><button onClick={() => setEndSessionStep(2)} className="btn-soft w-full sm:w-auto">Continuar</button></div></Modal>}
     {!readOnly && endSessionStep === 2 && <Modal title="Confirmação final" onClose={() => setEndSessionStep(0)}><p className="text-sm leading-relaxed text-ink/55">Essa ação não pode ser desfeita: a pelada de hoje será encerrada e nenhuma nova partida poderá começar.</p><div className="mt-6 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end"><button onClick={() => setEndSessionStep(0)} className="btn-soft w-full sm:w-auto">Cancelar</button><button disabled={endingSession} onClick={finishSession} className="flex w-full items-center justify-center gap-2 rounded-xl bg-red-600 px-5 py-3 text-sm font-extrabold text-white transition hover:bg-red-700 disabled:opacity-60 sm:w-auto"><CircleStop size={17} /> {endingSession ? 'Finalizando...' : 'Sim, finalizar definitivamente'}</button></div></Modal>}
@@ -536,6 +640,13 @@ function TeamScore({ team, score, color, align }: { team?: Time; score: number; 
 function rankings(players: Participante[], events: GolEvento[]) { return players.map((p) => ({ ...p, gols: events.filter((e) => e.jogador_id === p.id).length, assistencias: events.filter((e) => e.assistente_id === p.id).length })).filter((p) => p.gols || p.assistencias).sort((a,b) => (b.gols + b.assistencias) - (a.gols + a.assistencias)) }
 function Stats({ players, events }: { players: Participante[]; events: GolEvento[] }) { const stats = rankings(players, events); const scorer = [...stats].sort((a,b) => b.gols-a.gols)[0]; const waiter = [...stats].sort((a,b) => b.assistencias-a.assistencias)[0]; return <div><div className="grid gap-4 md:grid-cols-2"><PodiumCard title="Artilheiro do dia" player={scorer} value={scorer?.gols ?? 0} unit="gols" color="bg-orange" icon={Trophy} /><PodiumCard title="Garçom do dia" player={waiter} value={waiter?.assistencias ?? 0} unit="assistências" color="bg-blue-400" icon={Crown} /></div><div className="panel mt-5 overflow-hidden"><div className="border-b border-ink/8 p-5"><p className="font-extrabold">Linha do tempo</p><p className="text-xs text-ink/40">Todos os gols registrados nesta sessão.</p></div><div className="divide-y divide-ink/7">{events.slice().reverse().map((e) => { const p = players.find((x) => x.id === e.jogador_id); const a = players.find((x) => x.id === e.assistente_id); return p && <div key={e.id} className="flex items-center gap-4 p-4"><span className="grid h-10 w-10 place-items-center rounded-full bg-turf-100">⚽</span><div className="flex-1"><p className="text-sm font-bold">Gol de {p.nome}</p><p className="text-xs text-ink/40">{a ? `Assistência de ${a.nome}` : 'Sem assistência'}</p></div><time className="text-xs font-semibold text-ink/35">{format(new Date(e.criado_em), 'HH:mm')}</time></div>})}{!events.length && <EmptyState icon={Trophy} title="Nenhum evento registrado" text="Os gols marcados durante as partidas vão aparecer nesta linha do tempo." />}</div></div></div> }
 function PodiumCard({ title, player, value, unit, color, icon: Icon }: { title: string; player?: Participante; value: number; unit: string; color: string; icon: typeof Trophy }) { return <div className="panel relative overflow-hidden p-6"><div className={`absolute right-0 top-0 h-full w-2 ${color}`} /><div className="flex items-center gap-4">{player ? <Avatar player={player} size="lg" /> : <div className="avatar h-16 w-16">?</div>}<div className="flex-1"><p className="text-xs font-bold uppercase tracking-[.14em] text-ink/40">{title}</p><p className="mt-1 text-lg font-black">{player?.nome ?? 'Ainda indefinido'}</p><p className="text-sm text-ink/45">{value} {unit}</p></div><Icon size={32} className="text-amber-400" /></div></div> }
+
+const teamPlayerNames = (team: TimeHistorico | null) => team?.times_jogadores.map((link) => link.participantes?.nome).filter(Boolean).join(', ') || 'Jogadores não encontrados'
+const teamStrength = (team: TimeHistorico | null) => team?.forca_media == null ? '—' : Number(team.forca_media).toFixed(2)
+
+function MatchResultCard({ match, label }: { match: PartidaHistorica; label: string }) {
+  return <div className="rounded-2xl border border-ink/8 bg-white p-4"><p className="mb-4 text-center text-[10px] font-extrabold uppercase tracking-[.14em] text-ink/35">{label}</p><div className="grid items-center gap-4 md:grid-cols-[1fr_auto_1fr]"><HistoricalTeam team={match.time_a} names={teamPlayerNames(match.time_a)} strength={teamStrength(match.time_a)} /><div className="rounded-xl bg-ink px-4 py-2 text-center text-xl font-black text-white">{match.placar_a} × {match.placar_b}</div><HistoricalTeam team={match.time_b} names={teamPlayerNames(match.time_b)} strength={teamStrength(match.time_b)} right /></div></div>
+}
 
 function HistoryPage({ players, events }: { players: Participante[]; events: GolEvento[] }) {
   const demoEvents = events.length || hasSupabase ? events : [...Array(35)].map((_, i) => ({ id: `de${i}`, partida_id: 'old', jogador_id: players[i % 12].id, assistente_id: i % 3 ? players[(i + 3) % 12].id : null, time_id: 'old', criado_em: new Date().toISOString() }))
@@ -586,12 +697,9 @@ function HistoryPage({ players, events }: { players: Participante[]; events: Gol
     setMatchesBySession((old) => ({ ...old, [sessionId]: (data ?? []) as unknown as PartidaHistorica[] }))
   }
 
-  const names = (team: TimeHistorico | null) => team?.times_jogadores.map((link) => link.participantes?.nome).filter(Boolean).join(', ') || 'Jogadores não encontrados'
-  const strength = (team: TimeHistorico | null) => team?.forca_media == null ? '—' : Number(team.forca_media).toFixed(2)
-
   return <div><div className="grid gap-4 sm:grid-cols-3"><div className="panel p-5"><p className="text-xs font-bold uppercase tracking-[.13em] text-ink/40">Sessões realizadas</p><p className="mt-2 text-3xl font-black">{hasSupabase ? sessions.length : 24}</p><p className="mt-1 text-xs text-turf-600">sessões finalizadas</p></div><div className="panel p-5"><p className="text-xs font-bold uppercase tracking-[.13em] text-ink/40">Gols registrados</p><p className="mt-2 text-3xl font-black">{demoEvents.length}</p><p className="mt-1 text-xs text-ink/40">eventos carregados</p></div><div className="panel p-5"><p className="text-xs font-bold uppercase tracking-[.13em] text-ink/40">Jogadores no ranking</p><p className="mt-2 text-3xl font-black">{stats.length}</p><p className="mt-1 text-xs text-ink/40">histórico acumulado</p></div></div><div className="panel mt-5 overflow-hidden"><div className="flex items-center justify-between gap-3 border-b border-ink/8 p-5"><div><p className="font-extrabold">Ranking geral</p><p className="text-xs text-ink/40">Gols e assistências em sessões finalizadas.</p></div><span className="chip shrink-0 bg-turf-100 text-turf-700">Temporada 2026</span></div><div className="divide-y divide-ink/7 md:hidden">{stats.map((p,i) => <div key={p.id} className="flex items-center gap-3 p-4"><span className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg text-xs font-black ${i < 3 ? 'bg-lime' : 'bg-ink/5 text-ink/45'}`}>{i+1}</span><Avatar player={p} size="sm" /><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{p.nome}</p><p className="text-[10px] text-ink/40">{positionLabel[p.posicao]}</p><div className="mt-2 flex flex-wrap gap-1.5 text-[10px] font-bold"><span className="chip bg-ink/5 text-ink/55">{p.gols} gols</span><span className="chip bg-ink/5 text-ink/55">{p.assistencias} assist.</span><span className="chip bg-turf-100 text-turf-700">{p.gols+p.assistencias} particip.</span></div></div></div>)}</div><div className="hidden overflow-x-auto md:block"><table className="w-full min-w-[600px] text-left"><thead><tr className="bg-ink/[.025] text-[10px] font-extrabold uppercase tracking-[.13em] text-ink/40"><th className="px-5 py-3">#</th><th className="px-3 py-3">Jogador</th><th className="px-3 py-3 text-center">Gols</th><th className="px-3 py-3 text-center">Assist.</th><th className="px-5 py-3 text-right">Participações</th></tr></thead><tbody className="divide-y divide-ink/7">{stats.map((p,i) => <tr key={p.id} className="hover:bg-turf-50"><td className="px-5 py-4"><span className={`grid h-8 w-8 place-items-center rounded-lg text-xs font-black ${i < 3 ? 'bg-lime' : 'bg-ink/5 text-ink/45'}`}>{i+1}</span></td><td className="px-3 py-4"><div className="flex items-center gap-3"><Avatar player={p} size="sm" /><div><p className="text-sm font-bold">{p.nome}</p><p className="text-[10px] text-ink/40">{positionLabel[p.posicao]}</p></div></div></td><td className="px-3 py-4 text-center text-lg font-black">{p.gols}</td><td className="px-3 py-4 text-center text-lg font-black">{p.assistencias}</td><td className="px-5 py-4 text-right"><span className="chip bg-turf-100 text-turf-700">{p.gols+p.assistencias}</span></td></tr>)}</tbody></table></div></div>
 
-    <section className="mt-8"><div><p className="text-xl font-black">Sessões anteriores</p><p className="mt-1 text-sm text-ink/45">Placares, escalações e força média de cada time.</p></div><div className="mt-4 space-y-3">{sessionsLoading ? <div className="panel grid min-h-48 place-items-center"><div className="h-8 w-8 animate-spin rounded-full border-4 border-ink/10 border-t-turf-500" /></div> : sessions.length ? sessions.map((session) => { const isOpen = expanded === session.id; const matches = matchesBySession[session.id]; return <article key={session.id} className="panel overflow-hidden"><button onClick={() => toggleSession(session.id)} className="flex w-full items-center gap-4 p-5 text-left hover:bg-ink/[.025]"><div className="grid h-11 w-11 place-items-center rounded-xl bg-turf-100 text-turf-700"><CalendarDays size={20} /></div><div className="min-w-0 flex-1"><p className="font-extrabold">{format(new Date(`${session.data}T12:00:00`), "dd 'de' MMMM 'de' yyyy", { locale: ptBR })}</p><p className="mt-1 text-xs text-ink/40">{session.partidas_count} {session.partidas_count === 1 ? 'partida' : 'partidas'}{session.horario_fim ? ` · encerrada às ${format(new Date(session.horario_fim), 'HH:mm')}` : ''}</p></div><ChevronRight className={`text-ink/35 transition-transform ${isOpen ? 'rotate-90' : ''}`} size={20} /></button>{isOpen && <div className="border-t border-ink/8 bg-ink/[.018] p-4 md:p-5">{loadingSession === session.id ? <div className="grid min-h-28 place-items-center"><div className="h-7 w-7 animate-spin rounded-full border-4 border-ink/10 border-t-turf-500" /></div> : matches?.length ? <div className="space-y-3">{matches.map((match, index) => <div key={match.id} className="rounded-2xl border border-ink/8 bg-white p-4"><p className="mb-4 text-center text-[10px] font-extrabold uppercase tracking-[.14em] text-ink/35">Partida {index + 1} · {format(new Date(match.horario_inicio), 'HH:mm')}</p><div className="grid items-center gap-4 md:grid-cols-[1fr_auto_1fr]"><HistoricalTeam team={match.time_a} names={names(match.time_a)} strength={strength(match.time_a)} /><div className="rounded-xl bg-ink px-4 py-2 text-center text-xl font-black text-white">{match.placar_a} × {match.placar_b}</div><HistoricalTeam team={match.time_b} names={names(match.time_b)} strength={strength(match.time_b)} right /></div></div>)}</div> : <p className="py-8 text-center text-sm text-ink/40">Nenhuma partida finalizada nesta sessão.</p>}</div>}</article> }) : <div className="panel"><EmptyState icon={History} title="Nenhuma sessão finalizada" text="Depois que a primeira sessão for encerrada, os placares, times e jogadores aparecerão aqui." /></div>}</div></section>
+    <section className="mt-8"><div><p className="text-xl font-black">Sessões anteriores</p><p className="mt-1 text-sm text-ink/45">Placares, escalações e força média de cada time.</p></div><div className="mt-4 space-y-3">{sessionsLoading ? <div className="panel grid min-h-48 place-items-center"><div className="h-8 w-8 animate-spin rounded-full border-4 border-ink/10 border-t-turf-500" /></div> : sessions.length ? sessions.map((session) => { const isOpen = expanded === session.id; const matches = matchesBySession[session.id]; return <article key={session.id} className="panel overflow-hidden"><button onClick={() => toggleSession(session.id)} className="flex w-full items-center gap-4 p-5 text-left hover:bg-ink/[.025]"><div className="grid h-11 w-11 place-items-center rounded-xl bg-turf-100 text-turf-700"><CalendarDays size={20} /></div><div className="min-w-0 flex-1"><p className="font-extrabold">{format(new Date(`${session.data}T12:00:00`), "dd 'de' MMMM 'de' yyyy", { locale: ptBR })}</p><p className="mt-1 text-xs text-ink/40">{session.partidas_count} {session.partidas_count === 1 ? 'partida' : 'partidas'}{session.horario_fim ? ` · encerrada às ${format(new Date(session.horario_fim), 'HH:mm')}` : ''}</p></div><ChevronRight className={`text-ink/35 transition-transform ${isOpen ? 'rotate-90' : ''}`} size={20} /></button>{isOpen && <div className="border-t border-ink/8 bg-ink/[.018] p-4 md:p-5">{loadingSession === session.id ? <div className="grid min-h-28 place-items-center"><div className="h-7 w-7 animate-spin rounded-full border-4 border-ink/10 border-t-turf-500" /></div> : matches?.length ? <div className="space-y-3">{matches.map((match, index) => <MatchResultCard key={match.id} match={match} label={`Partida ${index + 1} · ${format(new Date(match.horario_inicio), 'HH:mm')}`} />)}</div> : <p className="py-8 text-center text-sm text-ink/40">Nenhuma partida finalizada nesta sessão.</p>}</div>}</article> }) : <div className="panel"><EmptyState icon={History} title="Nenhuma sessão finalizada" text="Depois que a primeira sessão for encerrada, os placares, times e jogadores aparecerão aqui." /></div>}</div></section>
   </div>
 }
 
