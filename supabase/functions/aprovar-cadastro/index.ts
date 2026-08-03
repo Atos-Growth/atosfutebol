@@ -26,10 +26,11 @@ Deno.serve(async (req) => {
     const { data: caller } = await userClient.from('perfis').select('papel').eq('id', authData.user.id).maybeSingle()
     if (caller?.papel !== 'admin') return json({ error: 'Não autorizado' }, 401)
 
-    const { usuario_id: usuarioId } = await req.json()
+    const { usuario_id: usuarioId, papel: papelSolicitado } = await req.json()
     if (!isUuid(usuarioId)) return json({ error: 'Usuário inválido' }, 400)
+    const papel = papelSolicitado === 'admin' ? 'admin' : 'normal'
     const service = createClient(url, serviceKey, { auth: { persistSession: false, autoRefreshToken: false } })
-    const { data, error } = await service.from('perfis').update({ papel: 'normal' }).eq('id', usuarioId).eq('papel', 'pendente').select('id').maybeSingle()
+    const { data, error } = await service.from('perfis').update({ papel }).eq('id', usuarioId).eq('papel', 'pendente').select('id').maybeSingle()
     if (error) throw error
     if (!data) return json({ error: 'Cadastro pendente não encontrado' }, 404)
     return json({ ok: true })
