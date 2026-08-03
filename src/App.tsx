@@ -115,6 +115,15 @@ function App() {
     if (!error) setSessionMatches((data ?? []) as unknown as PartidaHistorica[])
   }
 
+  const loadSessionEvents = async (targetSessionId: string) => {
+    if (!supabase) return
+    const { data: partidas } = await supabase.from('partidas').select('id').eq('sessao_id', targetSessionId)
+    const ids = (partidas ?? []).map((p) => p.id)
+    if (!ids.length) { setEvents([]); return }
+    const { data } = await supabase.from('eventos').select('*').in('partida_id', ids).order('criado_em')
+    setEvents((data ?? []) as GolEvento[])
+  }
+
   const reloadPendingDraw = async (targetSessionId: string) => {
     if (!supabase) return
     const { data: sessionRow } = await supabase.from('sessoes').select('pendente_escolha_partida_id').eq('id', targetSessionId).maybeSingle()
@@ -167,8 +176,7 @@ function App() {
       if (teamData) setTeams(teamData.map((t) => ({ ...t, jogadores: t.times_jogadores.map((j: { participantes: Participante }) => j.participantes) })) as Time[])
       const { data: matchData } = await db.from('partidas').select('*').eq('sessao_id', sessionData.id).eq('status', 'em_andamento').maybeSingle()
       setMatch((matchData as Match | null) ?? null)
-      if (matchData) { const { data: ev } = await db.from('eventos').select('*').eq('partida_id', matchData.id).order('criado_em'); setEvents((ev ?? []) as GolEvento[]) }
-      else setEvents([])
+      await loadSessionEvents(sessionData.id)
       await loadSessionMatches(sessionData.id)
       if (sessionData.pendente_escolha_partida_id) {
         const { data: pendingData } = await db.from('partidas').select('*').eq('id', sessionData.pendente_escolha_partida_id).maybeSingle()
@@ -188,17 +196,14 @@ function App() {
     const reloadMatch = async () => {
       const { data: matchData } = await db.from('partidas').select('*').eq('sessao_id', sessionId).eq('status', 'em_andamento').maybeSingle()
       setMatch((matchData as Match | null) ?? null)
-      if (matchData) {
-        const { data: ev } = await db.from('eventos').select('*').eq('partida_id', matchData.id).order('criado_em')
-        setEvents((ev ?? []) as GolEvento[])
-      } else setEvents([])
+      await loadSessionEvents(sessionId)
     }
     let channel = db.channel(`sessao:${sessionId}:${match?.id ?? 'sem-partida'}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'partidas', filter: `sessao_id=eq.${sessionId}` }, ({ new: next }) => {
         if (!next) return
         const incoming = next as Match
         if (incoming.status === 'em_andamento') {
-          setMatch((old) => { if (old?.id !== incoming.id) setEvents([]); return incoming })
+          setMatch(incoming)
         } else { setMatch((old) => old?.id === incoming.id ? null : old); void loadSessionMatches(sessionId); void reloadPendingDraw(sessionId) }
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'times', filter: `sessao_id=eq.${sessionId}` }, () => { void reloadTeams(); void reloadPendingDraw(sessionId) })
@@ -229,7 +234,7 @@ function App() {
   ]
   const nav = papel === 'normal' ? navAll.filter((item) => item.key === 'participantes' || item.key === 'partida' || item.key === 'historico') : navAll
 
-  const pageTitle: Record<View, string> = { inicio: 'Domingo é dia de jogo', participantes: 'Participantes', checkin: 'Check-in do dia', sorteio: 'Montar os times', partida: 'Partida ao vivo', estatisticas: 'Estatísticas do dia', historico: 'Estatísticas históricas', aprovacoes: 'Aprovações de acesso' }
+  const pageTitle: Record<View, string> = { inicio: 'Hoje é dia de jogo', participantes: 'Participantes', checkin: 'Check-in do dia', sorteio: 'Montar os times', partida: 'Partida ao vivo', estatisticas: 'Estatísticas do dia', historico: 'Estatísticas históricas', aprovacoes: 'Aprovações de acesso' }
 
   if (loading) return <div className="grid min-h-screen place-items-center bg-ink text-white"><div className="text-center"><div className="mx-auto mb-4 h-10 w-10 animate-spin rounded-full border-4 border-white/20 border-t-lime" /><p className="font-bold">Preparando o campo...</p></div></div>
   if (hasSupabase && !authEmail) return <AuthScreen />
@@ -240,13 +245,13 @@ function App() {
       <button aria-label="Fechar menu" onClick={() => setMobileMenu(false)} className="absolute right-4 top-4 rounded-lg p-2 text-white/60 md:hidden"><X /></button>
       <div className="flex items-center gap-3 px-2 py-3"><div className="grid h-11 w-11 place-items-center rounded-2xl bg-lime text-ink"><Shirt size={24} strokeWidth={2.5} /></div><div><p className="font-display text-lg font-black uppercase leading-none">Atos</p><p className="text-xs font-semibold tracking-[.24em] text-lime">FUTEBOL</p></div></div>
       <nav className="mt-7 space-y-1">{nav.map((item) => <button key={item.key} onClick={() => { setView(item.key); setMobileMenu(false) }} className={`flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-sm font-semibold transition ${view === item.key ? 'bg-white text-ink' : 'text-white/60 hover:bg-white/10 hover:text-white'}`}><item.icon size={19} /><span>{item.label}</span>{view === item.key && <ChevronRight className="ml-auto" size={16} />}</button>)}</nav>
-      <div className="mt-auto rounded-2xl bg-white/7 p-4"><div className={`flex items-center gap-2 text-xs font-bold ${sessionReady ? 'text-lime' : 'text-white/45'}`}><span className={`h-2 w-2 rounded-full ${sessionReady ? 'live-dot bg-lime' : 'bg-white/25'}`} /> {sessionReady ? 'SESSÃO ATIVA' : 'AGUARDANDO SESSÃO'}</div><p className="mt-2 text-sm font-bold">Pelada de domingo</p><p className="mt-1 text-xs text-white/45">{format(new Date(), "dd 'de' MMMM", { locale: ptBR })}{sessionReady ? ` · ${checkedPlayers.length} presentes` : ''}</p></div>
+      <div className="mt-auto rounded-2xl bg-white/7 p-4"><div className={`flex items-center gap-2 text-xs font-bold ${sessionReady ? 'text-lime' : 'text-white/45'}`}><span className={`h-2 w-2 rounded-full ${sessionReady ? 'live-dot bg-lime' : 'bg-white/25'}`} /> {sessionReady ? 'SESSÃO ATIVA' : 'AGUARDANDO SESSÃO'}</div><p className="mt-2 text-sm font-bold">Pelada de hoje</p><p className="mt-1 text-xs text-white/45">{format(new Date(), "dd 'de' MMMM", { locale: ptBR })}{sessionReady ? ` · ${checkedPlayers.length} presentes` : ''}</p></div>
       <div className="mt-3 flex items-center justify-between gap-2 px-3 py-2"><button onClick={() => supabase?.auth.signOut()} className="flex min-w-0 items-center gap-2 text-xs text-white/40 hover:text-white"><LogOut size={14} /><span className="truncate">{authEmail}</span></button><span className="chip bg-white/10 text-[10px] uppercase text-white/55">{papel}</span></div>
     </aside>
     {mobileMenu && <button className="fixed inset-0 z-30 bg-ink/50 md:hidden" onClick={() => setMobileMenu(false)} aria-label="Fechar menu" />}
 
     <main className="min-w-0 flex-1">
-      <header className="flex h-20 items-center justify-between border-b border-ink/8 px-4 md:px-8"><div className="flex items-center gap-3"><button className="rounded-xl bg-white p-2.5 shadow-sm md:hidden" onClick={() => setMobileMenu(true)} aria-label="Abrir menu"><Menu size={20} /></button>{view !== 'inicio' && <div><p className="text-[11px] font-extrabold uppercase tracking-[.15em] text-turf-600">Pelada de domingo</p><h1 className="text-lg font-extrabold md:text-xl">{pageTitle[view]}</h1></div>}</div><div className="hidden items-center gap-3 sm:flex"><span className={`chip ${hasSupabase ? 'bg-turf-100 text-turf-700' : 'bg-amber-100 text-amber-800'}`}>{hasSupabase ? <><span className="h-1.5 w-1.5 rounded-full bg-turf-500" /> Sincronizado</> : 'Modo demo'}</span></div></header>
+      <header className="flex h-20 items-center justify-between border-b border-ink/8 px-4 md:px-8"><div className="flex items-center gap-3"><button className="rounded-xl bg-white p-2.5 shadow-sm md:hidden" onClick={() => setMobileMenu(true)} aria-label="Abrir menu"><Menu size={20} /></button>{view !== 'inicio' && <div><p className="text-[11px] font-extrabold uppercase tracking-[.15em] text-turf-600">Pelada de hoje</p><h1 className="text-lg font-extrabold md:text-xl">{pageTitle[view]}</h1></div>}</div><div className="hidden items-center gap-3 sm:flex"><span className={`chip ${hasSupabase ? 'bg-turf-100 text-turf-700' : 'bg-amber-100 text-amber-800'}`}>{hasSupabase ? <><span className="h-1.5 w-1.5 rounded-full bg-turf-500" /> Sincronizado</> : 'Modo demo'}</span></div></header>
       <div className="mx-auto max-w-[1440px] p-4 pb-24 md:p-8">
         {view === 'inicio' && <Dashboard players={players} checkins={checkins} teams={teams} match={match} setView={setView} />}
         {view === 'participantes' && <Participants players={players} setPlayers={setPlayers} papel={papel} userId={userId} />}
@@ -635,7 +640,7 @@ function LiveMatch({ readOnly, teams, setTeams, players, match, setMatch, events
   </div>
 }
 
-function TeamScore({ team, score, color, align }: { team?: Time; score: number; color: string; align: 'left' | 'right' }) { return <div className={`panel flex items-center gap-4 p-4 ${align === 'right' ? 'xl:flex-row-reverse xl:text-right' : ''}`}><span className="grid h-14 w-14 shrink-0 place-items-center rounded-2xl text-xl font-black" style={{ background: color }}>{team?.numero ?? '?'}</span><div className="min-w-0 flex-1"><p className="text-xs font-bold uppercase tracking-[.14em] text-ink/40">Time {team?.numero ?? '—'}</p><p className="truncate text-sm font-extrabold">{team?.jogadores.slice(0,3).map((p) => p.apelido || p.nome.split(' ')[0]).join(', ') ?? 'Aguardando'}</p></div><p className="text-5xl font-black">{score}</p></div> }
+function TeamScore({ team, score, color, align }: { team?: Time; score: number; color: string; align: 'left' | 'right' }) { return <div className={`panel flex items-center gap-4 p-4 ${align === 'right' ? 'xl:flex-row-reverse xl:text-right' : ''}`}><span className="grid h-14 w-14 shrink-0 place-items-center rounded-2xl text-xl font-black" style={{ background: color }}>{team?.numero ?? '?'}</span><div className="min-w-0 flex-1"><p className="text-sm font-extrabold">Time {team?.numero ?? '—'}</p></div><p className="text-5xl font-black">{score}</p></div> }
 
 function rankings(players: Participante[], events: GolEvento[]) { return players.map((p) => ({ ...p, gols: events.filter((e) => e.jogador_id === p.id).length, assistencias: events.filter((e) => e.assistente_id === p.id).length })).filter((p) => p.gols || p.assistencias).sort((a,b) => (b.gols + b.assistencias) - (a.gols + a.assistencias)) }
 function Stats({ players, events }: { players: Participante[]; events: GolEvento[] }) { const stats = rankings(players, events); const scorer = [...stats].sort((a,b) => b.gols-a.gols)[0]; const waiter = [...stats].sort((a,b) => b.assistencias-a.assistencias)[0]; return <div><div className="grid gap-4 md:grid-cols-2"><PodiumCard title="Artilheiro do dia" player={scorer} value={scorer?.gols ?? 0} unit="gols" color="bg-orange" icon={Trophy} /><PodiumCard title="Garçom do dia" player={waiter} value={waiter?.assistencias ?? 0} unit="assistências" color="bg-blue-400" icon={Crown} /></div><div className="panel mt-5 overflow-hidden"><div className="border-b border-ink/8 p-5"><p className="font-extrabold">Linha do tempo</p><p className="text-xs text-ink/40">Todos os gols registrados nesta sessão.</p></div><div className="divide-y divide-ink/7">{events.slice().reverse().map((e) => { const p = players.find((x) => x.id === e.jogador_id); const a = players.find((x) => x.id === e.assistente_id); return p && <div key={e.id} className="flex items-center gap-4 p-4"><span className="grid h-10 w-10 place-items-center rounded-full bg-turf-100">⚽</span><div className="flex-1"><p className="text-sm font-bold">Gol de {p.nome}</p><p className="text-xs text-ink/40">{a ? `Assistência de ${a.nome}` : 'Sem assistência'}</p></div><time className="text-xs font-semibold text-ink/35">{format(new Date(e.criado_em), 'HH:mm')}</time></div>})}{!events.length && <EmptyState icon={Trophy} title="Nenhum evento registrado" text="Os gols marcados durante as partidas vão aparecer nesta linha do tempo." />}</div></div></div> }
