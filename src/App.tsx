@@ -14,6 +14,8 @@ type View = 'inicio' | 'participantes' | 'checkin' | 'sorteio' | 'partida' | 'hi
 type SessionStatus = 'aguardando_checkin' | 'sorteando' | 'em_andamento' | 'finalizada'
 type PerfilPendente = { id: string; email: string | null; criado_em: string }
 const RACHA_ATIVO_STORAGE_KEY = 'atos_racha_ativo'
+const VIEW_STORAGE_KEY = 'atos_view_ativa'
+const validViews: View[] = ['inicio', 'participantes', 'checkin', 'sorteio', 'partida', 'historico', 'aprovacoes']
 const pickRachaAtivo = (memberships: RachaMembro[], previous: string | null) => {
   if (previous && memberships.some((m) => m.racha_id === previous)) return previous
   return (memberships.find((m) => m.papel !== 'pendente') ?? memberships[0])?.racha_id ?? null
@@ -65,7 +67,11 @@ function WhatsAppButton() {
 }
 
 function App() {
-  const [view, setView] = useState<View>('inicio')
+  const [view, setView] = useState<View>(() => {
+    const stored = typeof window === 'undefined' ? null : window.localStorage.getItem(VIEW_STORAGE_KEY)
+    return validViews.includes(stored as View) ? (stored as View) : 'inicio'
+  })
+  useEffect(() => { window.localStorage.setItem(VIEW_STORAGE_KEY, view) }, [view])
   const [players, setPlayers] = useState<Participante[]>(demoPlayers)
   const [checkins, setCheckins] = useState<CheckIn[]>(demoCheckins)
   const [teams, setTeams] = useState<Time[]>([])
