@@ -23,17 +23,19 @@ Deno.serve(async (req) => {
     const userClient = createClient(url, anonKey, { global: { headers: { Authorization: authorization } }, auth: { persistSession: false, autoRefreshToken: false } })
     const { data: authData, error: authError } = await userClient.auth.getUser(token)
     if (authError || !authData.user) return json({ error: 'Não autorizado' }, 401)
-    const { data: caller } = await userClient.from('perfis').select('papel').eq('id', authData.user.id).maybeSingle()
+
+    const { usuario_id: usuarioId, racha_id: rachaId } = await req.json()
+    if (!isUuid(usuarioId) || !isUuid(rachaId)) return json({ error: 'Dados inválidos' }, 400)
+
+    const { data: caller } = await userClient.from('racha_membros').select('papel').eq('perfil_id', authData.user.id).eq('racha_id', rachaId).maybeSingle()
     if (caller?.papel !== 'admin') return json({ error: 'Não autorizado' }, 401)
 
-    const { usuario_id: usuarioId } = await req.json()
-    if (!isUuid(usuarioId)) return json({ error: 'Usuário inválido' }, 400)
+    // Só remove o vínculo pendente com este racha — a conta pode ter acesso
+    // válido a outros rachas, então nunca apaga o usuário em auth.users aqui.
     const service = createClient(url, serviceKey, { auth: { persistSession: false, autoRefreshToken: false } })
-    const { data: pending, error: profileError } = await service.from('perfis').select('id').eq('id', usuarioId).eq('papel', 'pendente').maybeSingle()
-    if (profileError) throw profileError
-    if (!pending) return json({ error: 'Cadastro pendente não encontrado' }, 404)
-    const { error: deleteError } = await service.auth.admin.deleteUser(usuarioId)
+    const { data: deleted, error: deleteError } = await service.from('racha_membros').delete().eq('perfil_id', usuarioId).eq('racha_id', rachaId).eq('papel', 'pendente').select('id').maybeSingle()
     if (deleteError) throw deleteError
+    if (!deleted) return json({ error: 'Cadastro pendente não encontrado' }, 404)
     return json({ ok: true })
   } catch (error) {
     console.error('Falha ao rejeitar cadastro', error instanceof Error ? error.message : 'erro desconhecido')

@@ -5,15 +5,19 @@ import toast from 'react-hot-toast'
 import {
   ArrowLeftRight, ArrowUpRight, BarChart3, CalendarDays, Check, ChevronRight, CircleStop,
   ClipboardCheck, Clock3, Crown, History, LayoutDashboard, LogOut,
-  Menu, MessageCircle, Pause, Play, Plus, RotateCcw, Search, Settings2, Shield,
+  Menu, MessageCircle, Pause, Pencil, Play, Plus, RotateCcw, Search, Settings2, Shield,
   Hourglass, Mail, RefreshCw, Shirt, Sparkles, Star, TimerReset, Trash2, Trophy, UserCheck, UserPlus, UserX, Users, X,
 } from 'lucide-react'
-import { CheckIn, GolEvento, hasSupabase, initials, Participante, positionLabel, Posicao, supabase, Time } from './lib/supabase'
+import { CheckIn, GolEvento, hasSupabase, initials, Papel, Participante, positionLabel, Posicao, Racha, RachaMembro, supabase, Time } from './lib/supabase'
 
 type View = 'inicio' | 'participantes' | 'checkin' | 'sorteio' | 'partida' | 'historico' | 'aprovacoes'
 type SessionStatus = 'aguardando_checkin' | 'sorteando' | 'em_andamento' | 'finalizada'
-type Papel = 'admin' | 'normal' | 'pendente'
 type PerfilPendente = { id: string; email: string | null; criado_em: string }
+const RACHA_ATIVO_STORAGE_KEY = 'atos_racha_ativo'
+const pickRachaAtivo = (memberships: RachaMembro[], previous: string | null) => {
+  if (previous && memberships.some((m) => m.racha_id === previous)) return previous
+  return (memberships.find((m) => m.papel !== 'pendente') ?? memberships[0])?.racha_id ?? null
+}
 type Match = { id: string; time_a_id: string; time_b_id: string; placar_a: number; placar_b: number; status: 'em_andamento' | 'finalizada'; horario_inicio: string; timer_started_at: string | null; timer_remaining_seconds: number; timer_running: boolean }
 type TimeHistorico = { id: string; numero: number; forca_media: number | string | null; times_jogadores: { participantes: { nome: string } | null }[] }
 type PartidaHistorica = { id: string; placar_a: number; placar_b: number; horario_inicio: string; time_a: TimeHistorico | null; time_b: TimeHistorico | null }
@@ -78,32 +82,45 @@ function App() {
   const [loading, setLoading] = useState(hasSupabase)
   const [authEmail, setAuthEmail] = useState<string | null>(hasSupabase ? null : 'Modo demonstração')
   const [userId, setUserId] = useState<string | null>(hasSupabase ? null : 'demo-user')
-  const [papel, setPapel] = useState<Papel | null>(hasSupabase ? null : 'admin')
+  const [memberships, setMemberships] = useState<RachaMembro[]>(hasSupabase ? [] : [{ racha_id: 'demo-racha', racha_nome: 'Racha demo', papel: 'admin' }])
+  const [rachaAtivoId, setRachaAtivoIdState] = useState<string | null>(() => hasSupabase ? (typeof window === 'undefined' ? null : window.localStorage.getItem(RACHA_ATIVO_STORAGE_KEY)) : 'demo-racha')
   const [sessionReady, setSessionReady] = useState(!hasSupabase)
+
+  const setRachaAtivoId = (id: string | null) => {
+    setRachaAtivoIdState(id)
+    if (id) window.localStorage.setItem(RACHA_ATIVO_STORAGE_KEY, id)
+    else window.localStorage.removeItem(RACHA_ATIVO_STORAGE_KEY)
+  }
+
+  const papel = memberships.find((m) => m.racha_id === rachaAtivoId)?.papel ?? null
 
   useEffect(() => {
     if (!supabase) return
     const applySession = (session: { user: { id: string; email?: string } } | null) => {
       setAuthEmail(session?.user.email ?? null)
       setUserId(session?.user.id ?? null)
-      if (!session) { setPapel(null); setLoading(false) }
+      if (!session) { setMemberships([]); setRachaAtivoId(null); setLoading(false) }
     }
     supabase.auth.getSession().then(({ data }) => applySession(data.session))
     const { data: listener } = supabase.auth.onAuthStateChange((_event, next) => applySession(next))
     return () => listener.subscription.unsubscribe()
   }, [])
 
-  const refreshPapel = async () => {
+  const refreshMemberships = async () => {
     if (!supabase || !userId) return
     setLoading(true)
-    const { data, error } = await supabase.from('perfis').select('papel').eq('id', userId).maybeSingle()
-    if (error) toast.error('Não foi possível verificar o papel de acesso.')
-    const next = data?.papel
-    setPapel(next === 'admin' || next === 'normal' || next === 'pendente' ? next : 'pendente')
+    const { data, error } = await supabase.from('racha_membros').select('racha_id, papel, rachas(nome)').eq('perfil_id', userId)
+    if (error) toast.error('Não foi possível verificar seus rachas.')
+    const list: RachaMembro[] = (data ?? []).map((row) => {
+      const linha = row as unknown as { racha_id: string; papel: Papel; rachas: { nome: string } | null }
+      return { racha_id: linha.racha_id, papel: linha.papel, racha_nome: linha.rachas?.nome ?? 'Racha' }
+    })
+    setMemberships(list)
+    setRachaAtivoId(pickRachaAtivo(list, rachaAtivoId))
     setLoading(false)
   }
 
-  useEffect(() => { void refreshPapel() }, [userId])
+  useEffect(() => { void refreshMemberships() }, [userId])
 
   const loadSessionMatches = async (targetSessionId: string) => {
     if (!supabase) return
@@ -134,8 +151,8 @@ function App() {
   }
 
   const startNewSession = async () => {
-    if (!supabase || papel !== 'admin') return false
-    const created = await supabase.from('sessoes').insert({ data: format(new Date(), 'yyyy-MM-dd'), tamanho_time: 6, duracao_partida_minutos: 10 }).select().single()
+    if (!supabase || papel !== 'admin' || !rachaAtivoId) return false
+    const created = await supabase.from('sessoes').insert({ racha_id: rachaAtivoId, data: format(new Date(), 'yyyy-MM-dd'), tamanho_time: 6, duracao_partida_minutos: 10 }).select().single()
     if (created.error) { toast.error('Não foi possível abrir uma nova sessão.'); return false }
     const sessionData = created.data
     setSessionId(sessionData.id)
@@ -153,12 +170,12 @@ function App() {
   }
 
   useEffect(() => {
-    if (!supabase || !authEmail || !papel || papel === 'pendente') return
+    if (!supabase || !authEmail || !papel || papel === 'pendente' || !rachaAtivoId) return
     const db = supabase
     const load = async () => {
-      const { data: participantData } = await db.from('participantes').select('*').order('nome')
+      const { data: participantData } = await db.from('participantes').select('*').eq('racha_id', rachaAtivoId).order('nome')
       if (participantData) setPlayers(participantData as Participante[])
-      const sessionQuery = await db.from('sessoes').select('*').neq('status', 'finalizada').order('criado_em', { ascending: false }).limit(1).maybeSingle()
+      const sessionQuery = await db.from('sessoes').select('*').eq('racha_id', rachaAtivoId).neq('status', 'finalizada').order('criado_em', { ascending: false }).limit(1).maybeSingle()
       if (sessionQuery.error) throw sessionQuery.error
       const sessionData = sessionQuery.data
       if (!sessionData && papel === 'admin') {
@@ -184,7 +201,7 @@ function App() {
       } else setPendingDrawMatch(null)
     }
     load().catch(() => toast.error('Não foi possível carregar a sessão.'))
-  }, [authEmail, papel])
+  }, [authEmail, papel, rachaAtivoId])
 
   useEffect(() => {
     if (!supabase || !sessionId || !sessionReady || !papel || papel === 'pendente') return
@@ -236,16 +253,21 @@ function App() {
 
   const pageTitle: Record<View, string> = { inicio: 'Hoje é dia de jogo', participantes: 'Participantes', checkin: 'Check-in do dia', sorteio: 'Montar os times', partida: 'Partida ao vivo', historico: 'Estatísticas históricas', aprovacoes: 'Aprovações de acesso' }
 
+  const rachaAtivoNome = memberships.find((m) => m.racha_id === rachaAtivoId)?.racha_nome ?? ''
+  const rachasAprovados = memberships.filter((m) => m.papel !== 'pendente')
+
   if (loading) return <div className="grid min-h-screen place-items-center bg-ink text-white"><div className="text-center"><div className="mx-auto mb-4 h-10 w-10 animate-spin rounded-full border-4 border-white/20 border-t-lime" /><p className="font-bold">Preparando o campo...</p></div></div>
   if (hasSupabase && !authEmail) return <AuthScreen />
-  if (papel === 'pendente') return <PendingApproval email={authEmail} onCheck={refreshPapel} />
+  if (hasSupabase && !rachaAtivoId) return <EscolherRacha memberships={memberships} onSolicitado={refreshMemberships} onEntrarEm={(id) => setRachaAtivoId(id)} />
+  if (papel === 'pendente') return <PendingApproval email={authEmail} rachaNome={rachaAtivoNome} outrosAprovados={rachasAprovados} onCheck={refreshMemberships} onEntrarEm={(id) => setRachaAtivoId(id)} onEscolherOutro={() => setRachaAtivoId(null)} />
 
   return <div className="min-h-screen md:flex">
     <aside className={`fixed inset-y-0 left-0 z-40 flex w-72 flex-col bg-ink p-5 text-white transition-transform md:sticky md:top-0 md:h-screen md:translate-x-0 ${mobileMenu ? 'translate-x-0' : '-translate-x-full'}`}>
       <button aria-label="Fechar menu" onClick={() => setMobileMenu(false)} className="absolute right-4 top-4 rounded-lg p-2 text-white/60 md:hidden"><X /></button>
       <div className="flex items-center gap-3 px-2 py-3"><div className="grid h-11 w-11 place-items-center rounded-2xl bg-lime text-ink"><Shirt size={24} strokeWidth={2.5} /></div><div><p className="font-display text-lg font-black uppercase leading-none">Atos</p><p className="text-xs font-semibold tracking-[.24em] text-lime">FUTEBOL</p></div></div>
       <nav className="mt-7 space-y-1">{nav.map((item) => <button key={item.key} onClick={() => { setView(item.key); setMobileMenu(false) }} className={`flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-sm font-semibold transition ${view === item.key ? 'bg-white text-ink' : 'text-white/60 hover:bg-white/10 hover:text-white'}`}><item.icon size={19} /><span>{item.label}</span>{view === item.key && <ChevronRight className="ml-auto" size={16} />}</button>)}</nav>
-      <div className="mt-auto rounded-2xl bg-white/7 p-4"><div className={`flex items-center gap-2 text-xs font-bold ${sessionReady ? 'text-lime' : 'text-white/45'}`}><span className={`h-2 w-2 rounded-full ${sessionReady ? 'live-dot bg-lime' : 'bg-white/25'}`} /> {sessionReady ? 'SESSÃO ATIVA' : 'AGUARDANDO SESSÃO'}</div><p className="mt-2 text-sm font-bold">Pelada de hoje</p><p className="mt-1 text-xs text-white/45">{format(new Date(), "dd 'de' MMMM", { locale: ptBR })}{sessionReady ? ` · ${checkedPlayers.length} presentes` : ''}</p></div>
+      {rachasAprovados.length > 1 && <select className="mt-4 w-full rounded-xl border border-white/15 bg-white/10 px-3 py-2.5 text-sm font-bold text-white" value={rachaAtivoId ?? ''} onChange={(e) => setRachaAtivoId(e.target.value)}>{rachasAprovados.map((m) => <option key={m.racha_id} value={m.racha_id} className="text-ink">{m.racha_nome}</option>)}</select>}
+      <div className="mt-auto rounded-2xl bg-white/7 p-4"><div className={`flex items-center gap-2 text-xs font-bold ${sessionReady ? 'text-lime' : 'text-white/45'}`}><span className={`h-2 w-2 rounded-full ${sessionReady ? 'live-dot bg-lime' : 'bg-white/25'}`} /> {sessionReady ? 'SESSÃO ATIVA' : 'AGUARDANDO SESSÃO'}</div><p className="mt-2 text-sm font-bold">{rachaAtivoNome || 'Pelada de hoje'}</p><p className="mt-1 text-xs text-white/45">{format(new Date(), "dd 'de' MMMM", { locale: ptBR })}{sessionReady ? ` · ${checkedPlayers.length} presentes` : ''}</p></div>
       <div className="mt-3 flex items-center justify-between gap-2 px-3 py-2"><button onClick={() => supabase?.auth.signOut()} className="flex min-w-0 items-center gap-2 text-xs text-white/40 hover:text-white"><LogOut size={14} /><span className="truncate">{authEmail}</span></button><span className="chip bg-white/10 text-[10px] uppercase text-white/55">{papel}</span></div>
     </aside>
     {mobileMenu && <button className="fixed inset-0 z-30 bg-ink/50 md:hidden" onClick={() => setMobileMenu(false)} aria-label="Fechar menu" />}
@@ -254,12 +276,12 @@ function App() {
       <header className="flex h-20 items-center justify-between border-b border-ink/8 px-4 md:px-8"><div className="flex items-center gap-3"><button className="rounded-xl bg-white p-2.5 shadow-sm md:hidden" onClick={() => setMobileMenu(true)} aria-label="Abrir menu"><Menu size={20} /></button>{view !== 'inicio' && <div><p className="text-[11px] font-extrabold uppercase tracking-[.15em] text-turf-600">Pelada de hoje</p><h1 className="text-lg font-extrabold md:text-xl">{pageTitle[view]}</h1></div>}</div><div className="hidden items-center gap-3 sm:flex"><span className={`chip ${hasSupabase ? 'bg-turf-100 text-turf-700' : 'bg-amber-100 text-amber-800'}`}>{hasSupabase ? <><span className="h-1.5 w-1.5 rounded-full bg-turf-500" /> Sincronizado</> : 'Modo demo'}</span></div></header>
       <div className="mx-auto max-w-[1440px] p-4 pb-24 md:p-8">
         {view === 'inicio' && <Dashboard players={players} checkins={checkins} teams={teams} match={match} setView={setView} />}
-        {view === 'participantes' && <Participants players={players} setPlayers={setPlayers} papel={papel} userId={userId} />}
-        {view === 'checkin' && <Checkin players={players} checkins={checkins} setCheckins={setCheckins} sessionId={sessionId} teamSize={teamSize} />}
+        {view === 'participantes' && <Participants players={players} setPlayers={setPlayers} papel={papel} userId={userId} rachaId={rachaAtivoId} />}
+        {view === 'checkin' && <Checkin players={players} checkins={checkins} setCheckins={setCheckins} sessionId={sessionId} teamSize={teamSize} rachaId={rachaAtivoId} />}
         {view === 'sorteio' && <Draw players={players} checkins={checkins} setCheckins={setCheckins} teams={teams} setTeams={setTeams} teamSize={teamSize} setTeamSize={setTeamSize} sessionId={sessionId} setStatus={setStatus} status={status} goLive={() => setView('partida')} />}
-        {view === 'partida' && (!sessionReady ? <WaitingSession /> : <LiveMatch readOnly={papel === 'normal'} teams={teams} setTeams={setTeams} players={players} match={match} setMatch={setMatch} events={events} setEvents={setEvents} sessionId={sessionId} duration={duration} status={status} sessionMatches={sessionMatches} pendingDrawMatch={pendingDrawMatch} setPendingDrawMatch={setPendingDrawMatch} onSessionFinished={() => { setStatus('finalizada'); setView('historico'); void startNewSession() }} onOpenDurationSettings={() => setShowSettings(true)} />)}
-        {view === 'historico' && <HistoryPage players={players} />}
-        {view === 'aprovacoes' && papel === 'admin' && <Approvals />}
+        {view === 'partida' && (!sessionReady ? <WaitingSession /> : <LiveMatch readOnly={papel === 'normal'} teams={teams} setTeams={setTeams} players={players} match={match} setMatch={setMatch} events={events} setEvents={setEvents} sessionId={sessionId} rachaId={rachaAtivoId} duration={duration} status={status} sessionMatches={sessionMatches} pendingDrawMatch={pendingDrawMatch} setPendingDrawMatch={setPendingDrawMatch} onSessionFinished={() => { setStatus('finalizada'); setView('historico'); void startNewSession() }} onOpenDurationSettings={() => setShowSettings(true)} />)}
+        {view === 'historico' && <HistoryPage players={players} rachaId={rachaAtivoId} />}
+        {view === 'aprovacoes' && papel === 'admin' && rachaAtivoId && <Approvals rachaId={rachaAtivoId} rachaNome={rachaAtivoNome} />}
       </div>
     </main>
     {showSettings && <SessionSettingsModal duration={duration} sessionId={sessionId} onClose={() => setShowSettings(false)} onSaved={(newDuration) => { setDuration(newDuration); setShowSettings(false) }} />}
@@ -306,21 +328,61 @@ function AuthScreen() {
       return
     }
     const { data, error } = await supabase!.auth.signUp({ email, password })
-    if (error) { setBusy(false); toast.error(error.message); return }
-    if (data.session) await supabase!.auth.signOut()
-    setBusy(false); setSubmitted(true); setMode('login'); setPassword('')
-    toast.success('Cadastro enviado para aprovação!')
+    setBusy(false)
+    if (error) { toast.error(error.message); return }
+    if (!data.session) {
+      setSubmitted(true); setMode('login'); setPassword('')
+      toast.success('Confirme seu e-mail e depois entre para escolher seu racha.')
+      return
+    }
+    toast.success('Conta criada! Escolha o racha para pedir acesso.')
   }
-  return <div className="grid min-h-screen bg-ink p-5 md:grid-cols-2"><div className="hidden overflow-hidden rounded-[32px] bg-turf-600 p-12 text-white md:flex md:flex-col md:justify-between"><div className="flex items-center gap-3"><div className="grid h-12 w-12 place-items-center rounded-2xl bg-lime text-ink"><Shirt /></div><div><b className="font-display text-xl">ATOS</b><p className="text-xs tracking-[.2em] text-lime">FUTEBOL</p></div></div><div><p className="max-w-lg text-5xl font-black leading-[1.05]">Menos planilha.<br />Mais bola rolando.</p><p className="mt-5 max-w-md text-lg text-white/65">Organize a chegada, equilibre os times e acompanhe cada gol em tempo real.</p></div><p className="text-sm text-white/45">Gestão da pelada, do check-in à resenha.</p></div><div className="grid place-items-center p-4"><div className="w-full max-w-sm"><form onSubmit={submit} className="w-full text-white"><div className="mb-9 md:hidden"><div className="grid h-12 w-12 place-items-center rounded-2xl bg-lime text-ink"><Shirt /></div></div><p className="text-xs font-bold uppercase tracking-[.2em] text-lime">Acesso à pelada</p><h1 className="mt-2 text-3xl font-black">{mode === 'login' ? 'Entre para acompanhar' : 'Peça seu acesso'}</h1><p className="mt-2 text-sm text-white/45">{mode === 'login' ? 'Acompanhe a partida e o histórico do grupo.' : 'Seu cadastro será liberado pelo organizador.'}</p><div className="mt-7 grid grid-cols-2 rounded-xl bg-white/8 p-1"><button type="button" onClick={() => setMode('login')} className={`rounded-lg px-3 py-2.5 text-sm font-bold transition ${mode === 'login' ? 'bg-white text-ink' : 'text-white/50'}`}>Entrar</button><button type="button" onClick={() => setMode('signup')} className={`rounded-lg px-3 py-2.5 text-sm font-bold transition ${mode === 'signup' ? 'bg-white text-ink' : 'text-white/50'}`}>Criar conta</button></div>{submitted && mode === 'login' && <div className="mt-5 rounded-xl border border-lime/30 bg-lime/10 p-3 text-sm font-semibold text-lime">Cadastro enviado! Aguarde a aprovação do organizador.</div>}<label className="label mt-6 !text-white/50">E-mail</label><input className="input !border-white/15 !bg-white/10 !text-white" type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} required /><label className="label mt-4 !text-white/50">Senha</label><input className="input !border-white/15 !bg-white/10 !text-white" type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} minLength={6} value={password} onChange={(e) => setPassword(e.target.value)} required /><button className="btn-lime mt-6 w-full" disabled={busy}>{busy ? 'Aguarde...' : mode === 'login' ? 'Entrar' : 'Enviar cadastro'} <ChevronRight size={18} /></button></form><div className="mt-5 space-y-3"><PromoBanner text="Quer implementar IA na sua empresa? Clique aqui." /><WhatsAppButton /></div></div></div></div>
+  return <div className="grid min-h-screen bg-ink p-5 md:grid-cols-2"><div className="hidden overflow-hidden rounded-[32px] bg-turf-600 p-12 text-white md:flex md:flex-col md:justify-between"><div className="flex items-center gap-3"><div className="grid h-12 w-12 place-items-center rounded-2xl bg-lime text-ink"><Shirt /></div><div><b className="font-display text-xl">ATOS</b><p className="text-xs tracking-[.2em] text-lime">FUTEBOL</p></div></div><div><p className="max-w-lg text-5xl font-black leading-[1.05]">Menos planilha.<br />Mais bola rolando.</p><p className="mt-5 max-w-md text-lg text-white/65">Organize a chegada, equilibre os times e acompanhe cada gol em tempo real.</p></div><p className="text-sm text-white/45">Gestão da pelada, do check-in à resenha.</p></div><div className="grid place-items-center p-4"><div className="w-full max-w-sm"><form onSubmit={submit} className="w-full text-white"><div className="mb-9 md:hidden"><div className="grid h-12 w-12 place-items-center rounded-2xl bg-lime text-ink"><Shirt /></div></div><p className="text-xs font-bold uppercase tracking-[.2em] text-lime">Acesso à pelada</p><h1 className="mt-2 text-3xl font-black">{mode === 'login' ? 'Entre para acompanhar' : 'Crie sua conta'}</h1><p className="mt-2 text-sm text-white/45">{mode === 'login' ? 'Acompanhe a partida e o histórico do grupo.' : 'Depois você escolhe o racha e pede acesso ao organizador.'}</p><div className="mt-7 grid grid-cols-2 rounded-xl bg-white/8 p-1"><button type="button" onClick={() => setMode('login')} className={`rounded-lg px-3 py-2.5 text-sm font-bold transition ${mode === 'login' ? 'bg-white text-ink' : 'text-white/50'}`}>Entrar</button><button type="button" onClick={() => setMode('signup')} className={`rounded-lg px-3 py-2.5 text-sm font-bold transition ${mode === 'signup' ? 'bg-white text-ink' : 'text-white/50'}`}>Criar conta</button></div>{submitted && mode === 'login' && <div className="mt-5 rounded-xl border border-lime/30 bg-lime/10 p-3 text-sm font-semibold text-lime">Cadastro enviado! Confirme seu e-mail e entre para escolher seu racha.</div>}<label className="label mt-6 !text-white/50">E-mail</label><input className="input !border-white/15 !bg-white/10 !text-white" type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} required /><label className="label mt-4 !text-white/50">Senha</label><input className="input !border-white/15 !bg-white/10 !text-white" type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} minLength={6} value={password} onChange={(e) => setPassword(e.target.value)} required /><button className="btn-lime mt-6 w-full" disabled={busy}>{busy ? 'Aguarde...' : mode === 'login' ? 'Entrar' : 'Criar conta'} <ChevronRight size={18} /></button></form><div className="mt-5 space-y-3"><PromoBanner text="Quer implementar IA na sua empresa? Clique aqui." /><WhatsAppButton /></div></div></div></div>
 }
 
-function PendingApproval({ email, onCheck }: { email: string | null; onCheck: () => Promise<void> }) {
+function EscolherRacha({ memberships, onSolicitado, onEntrarEm }: { memberships: RachaMembro[]; onSolicitado: () => Promise<void>; onEntrarEm: (rachaId: string) => void }) {
+  const [rachas, setRachas] = useState<Racha[]>([])
+  const [loading, setLoading] = useState(true)
+  const [search, setSearch] = useState('')
+  const [busyId, setBusyId] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!supabase) return
+    supabase.from('rachas').select('id, nome').order('nome').then(({ data, error }) => {
+      if (error) toast.error('Não foi possível carregar os rachas.')
+      setRachas((data ?? []) as Racha[])
+      setLoading(false)
+    })
+  }, [])
+
+  const solicitar = async (racha: Racha) => {
+    if (!supabase) return
+    setBusyId(racha.id)
+    const { error } = await supabase.rpc('solicitar_acesso_racha', { p_racha_id: racha.id })
+    setBusyId(null)
+    if (error) return toast.error(error.message)
+    toast.success(`Solicitação enviada para ${racha.nome}!`)
+    await onSolicitado()
+  }
+
+  const jaVinculados = new Set(memberships.map((m) => m.racha_id))
+  const disponiveis = rachas.filter((r) => !jaVinculados.has(r.id) && r.nome.toLowerCase().includes(search.toLowerCase()))
+
+  return <div className="grid min-h-screen place-items-center bg-ink p-5 text-white"><div className="w-full max-w-lg"><div className="text-center"><div className="mx-auto grid h-20 w-20 place-items-center rounded-[28px] bg-lime text-ink"><Shirt size={32} /></div><span className="chip mt-6 bg-white/8 text-white/60">ÚLTIMO PASSO</span><h1 className="mt-4 text-3xl font-black md:text-4xl">Escolha seu racha</h1><p className="mx-auto mt-3 max-w-md text-sm leading-relaxed text-white/50">Pesquise pelo nome da pelada e peça acesso. O organizador libera sua entrada.</p></div>
+    {memberships.length > 0 && <div className="mt-6 space-y-2">{memberships.map((m) => <div key={m.racha_id} className="flex items-center justify-between gap-3 rounded-xl bg-white/8 px-4 py-3 text-sm"><span className="font-bold">{m.racha_nome}</span>{m.papel === 'pendente' ? <span className="chip bg-amber-400/20 text-amber-200">Aguardando aprovação</span> : <button onClick={() => onEntrarEm(m.racha_id)} className="btn-lime !min-h-9 !px-4 !py-1.5">Entrar</button>}</div>)}</div>}
+    <div className="relative mt-6"><Search className="absolute left-3 top-3.5 text-white/35" size={18} /><input className="input pl-10 !border-white/15 !bg-white/10 !text-white" placeholder="Buscar racha pelo nome..." value={search} onChange={(e) => setSearch(e.target.value)} /></div>
+    <div className="mt-3 max-h-72 space-y-2 overflow-auto">{loading ? <div className="grid min-h-24 place-items-center"><div className="h-7 w-7 animate-spin rounded-full border-4 border-white/15 border-t-lime" /></div> : disponiveis.length ? disponiveis.map((r) => <div key={r.id} className="flex items-center justify-between gap-3 rounded-xl border border-white/10 px-4 py-3 text-sm"><span className="font-bold">{r.nome}</span><button disabled={busyId === r.id} onClick={() => solicitar(r)} className="btn-soft !min-h-9 !bg-white/10 !px-4 !py-1.5 !text-white">{busyId === r.id ? 'Enviando...' : 'Solicitar acesso'}</button></div>) : <p className="py-6 text-center text-sm text-white/40">Nenhum racha encontrado com esse nome.</p>}</div>
+    <button onClick={() => supabase?.auth.signOut()} className="btn mt-6 w-full !bg-white/8 !text-white hover:!bg-white/12"><LogOut size={16} /> Sair</button>
+  </div></div>
+}
+
+function PendingApproval({ email, rachaNome, outrosAprovados, onCheck, onEntrarEm, onEscolherOutro }: { email: string | null; rachaNome: string; outrosAprovados: RachaMembro[]; onCheck: () => Promise<void>; onEntrarEm: (rachaId: string) => void; onEscolherOutro: () => void }) {
   const [checking, setChecking] = useState(false)
   const check = async () => { setChecking(true); await onCheck(); setChecking(false) }
-  return <div className="grid min-h-screen place-items-center bg-ink p-5 text-white"><div className="w-full max-w-lg text-center"><div className="mx-auto grid h-24 w-24 place-items-center rounded-[32px] bg-lime/15 text-lime"><Hourglass size={42} /></div><span className="chip mt-7 bg-white/8 text-white/60">CADASTRO RECEBIDO</span><h1 className="mt-4 text-3xl font-black md:text-4xl">Seu acesso está em análise</h1><p className="mx-auto mt-4 max-w-md text-sm leading-relaxed text-white/50">O organizador recebeu sua solicitação. Quando ela for aprovada, você poderá acompanhar a partida ao vivo e consultar o histórico.</p>{email && <div className="mx-auto mt-6 flex max-w-sm items-center justify-center gap-2 rounded-xl bg-white/5 px-4 py-3 text-sm text-white/60"><Mail size={16} /> {email}</div>}<div className="mt-8 flex flex-col justify-center gap-3 sm:flex-row"><button onClick={check} disabled={checking} className="btn-lime"><RefreshCw className={checking ? 'animate-spin' : ''} size={17} /> {checking ? 'Verificando...' : 'Verificar aprovação'}</button><button onClick={() => supabase?.auth.signOut()} className="btn !bg-white/8 !text-white hover:!bg-white/12"><LogOut size={16} /> Sair</button></div><div className="mt-6 space-y-3 text-left"><PromoBanner text="Quer implementar IA na sua empresa? Clique aqui." /><WhatsAppButton /></div></div></div>
+  return <div className="grid min-h-screen place-items-center bg-ink p-5 text-white"><div className="w-full max-w-lg text-center"><div className="mx-auto grid h-24 w-24 place-items-center rounded-[32px] bg-lime/15 text-lime"><Hourglass size={42} /></div><span className="chip mt-7 bg-white/8 text-white/60">CADASTRO RECEBIDO</span><h1 className="mt-4 text-3xl font-black md:text-4xl">Seu acesso a {rachaNome} está em análise</h1><p className="mx-auto mt-4 max-w-md text-sm leading-relaxed text-white/50">O organizador recebeu sua solicitação. Quando ela for aprovada, você poderá acompanhar a partida ao vivo e consultar o histórico.</p>{email && <div className="mx-auto mt-6 flex max-w-sm items-center justify-center gap-2 rounded-xl bg-white/5 px-4 py-3 text-sm text-white/60"><Mail size={16} /> {email}</div>}<div className="mt-8 flex flex-col justify-center gap-3 sm:flex-row"><button onClick={check} disabled={checking} className="btn-lime"><RefreshCw className={checking ? 'animate-spin' : ''} size={17} /> {checking ? 'Verificando...' : 'Verificar aprovação'}</button><button onClick={() => supabase?.auth.signOut()} className="btn !bg-white/8 !text-white hover:!bg-white/12"><LogOut size={16} /> Sair</button></div>{outrosAprovados.length > 0 && <button onClick={() => onEntrarEm(outrosAprovados[0].racha_id)} className="mt-4 text-sm font-semibold text-lime underline decoration-dotted underline-offset-4">Usar {outrosAprovados[0].racha_nome} enquanto isso</button>}<button onClick={onEscolherOutro} className="mt-3 block w-full text-xs font-semibold text-white/35 underline decoration-dotted underline-offset-4">Pedir acesso a outro racha</button><div className="mt-6 space-y-3 text-left"><PromoBanner text="Quer implementar IA na sua empresa? Clique aqui." /><WhatsAppButton /></div></div></div>
 }
 
-function Approvals() {
+function Approvals({ rachaId, rachaNome }: { rachaId: string; rachaNome: string }) {
   const [profiles, setProfiles] = useState<PerfilPendente[]>([])
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState<string | null>(null)
@@ -328,30 +390,33 @@ function Approvals() {
   const load = async () => {
     if (!supabase) return
     setLoading(true)
-    const { data, error } = await supabase.from('perfis').select('id,email,criado_em').eq('papel', 'pendente').order('criado_em')
+    const { data, error } = await supabase.from('racha_membros').select('perfil_id, criado_em, perfis(email)').eq('racha_id', rachaId).eq('papel', 'pendente').order('criado_em')
     if (error) toast.error('Não foi possível carregar as aprovações.')
-    else setProfiles((data ?? []) as PerfilPendente[])
+    else setProfiles((data ?? []).map((row) => {
+      const linha = row as unknown as { perfil_id: string; criado_em: string; perfis: { email: string | null } | null }
+      return { id: linha.perfil_id, email: linha.perfis?.email ?? null, criado_em: linha.criado_em }
+    }))
     setLoading(false)
   }
-  useEffect(() => { void load() }, [])
+  useEffect(() => { void load() }, [rachaId])
   const approve = async (profile: PerfilPendente) => {
     if (!supabase) return
     setBusy(profile.id)
     const papel = roles[profile.id] ?? 'normal'
-    const { error } = await supabase.functions.invoke('aprovar-cadastro', { body: { usuario_id: profile.id, papel } })
+    const { error } = await supabase.functions.invoke('aprovar-cadastro', { body: { usuario_id: profile.id, racha_id: rachaId, papel } })
     setBusy(null)
     if (error) return toast.error('Não foi possível aprovar este cadastro.')
     setProfiles((old) => old.filter((item) => item.id !== profile.id)); toast.success(`${profile.email ?? 'Usuário'} aprovado!`)
   }
   const reject = async (profile: PerfilPendente) => {
-    if (!supabase || !window.confirm(`Rejeitar ${profile.email ?? 'este cadastro'}? A conta será apagada permanentemente.`)) return
+    if (!supabase || !window.confirm(`Rejeitar ${profile.email ?? 'este cadastro'} em ${rachaNome}?`)) return
     setBusy(profile.id)
-    const { error } = await supabase.functions.invoke('rejeitar-cadastro', { body: { usuario_id: profile.id } })
+    const { error } = await supabase.functions.invoke('rejeitar-cadastro', { body: { usuario_id: profile.id, racha_id: rachaId } })
     setBusy(null)
     if (error) return toast.error('Não foi possível rejeitar este cadastro.')
-    setProfiles((old) => old.filter((item) => item.id !== profile.id)); toast.success('Cadastro rejeitado e conta removida.')
+    setProfiles((old) => old.filter((item) => item.id !== profile.id)); toast.success('Solicitação rejeitada.')
   }
-  return <div><div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div><p className="text-sm text-ink/45">Libere somente as pessoas que fazem parte da pelada.</p><span className="chip mt-3 bg-amber-100 text-amber-800"><Hourglass size={13} /> {profiles.length} aguardando</span></div><button onClick={load} disabled={loading} className="btn-soft"><RefreshCw className={loading ? 'animate-spin' : ''} size={16} /> Atualizar</button></div><div className="panel mt-5 overflow-hidden"><div className="border-b border-ink/8 p-5"><p className="font-extrabold">Solicitações pendentes</p><p className="mt-1 text-xs text-ink/40">A aprovação libera apenas a visualização da partida e do histórico.</p></div>{loading ? <div className="grid min-h-52 place-items-center"><div className="h-8 w-8 animate-spin rounded-full border-4 border-ink/10 border-t-turf-500" /></div> : profiles.length ? <div className="divide-y divide-ink/7">{profiles.map((profile) => <div key={profile.id} className="flex flex-col gap-4 p-5 sm:flex-row sm:items-center"><div className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-amber-100 text-amber-800"><Mail size={19} /></div><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{profile.email ?? 'E-mail não informado'}</p><p className="mt-1 text-xs text-ink/40">Solicitado {formatDistanceToNow(new Date(profile.criado_em), { addSuffix: true, locale: ptBR })}</p></div><select value={roles[profile.id] ?? 'normal'} onChange={(e) => setRoles((old) => ({ ...old, [profile.id]: e.target.value as 'normal' | 'admin' }))} className="input !min-h-9 !w-auto !py-1 text-xs"><option value="normal">Jogador</option><option value="admin">Administrador</option></select><div className="flex gap-2"><button disabled={busy === profile.id} onClick={() => reject(profile)} className="btn-soft flex-1 text-red-600 sm:flex-none"><UserX size={16} /> Rejeitar</button><button disabled={busy === profile.id} onClick={() => approve(profile)} className="btn-primary flex-1 sm:flex-none"><UserCheck size={16} /> Aprovar</button></div></div>)}</div> : <EmptyState icon={UserCheck} title="Tudo em dia" text="Não há novos cadastros aguardando sua decisão." />}</div></div>
+  return <div><div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div><p className="text-sm text-ink/45">Libere somente as pessoas que fazem parte de {rachaNome}.</p><span className="chip mt-3 bg-amber-100 text-amber-800"><Hourglass size={13} /> {profiles.length} aguardando</span></div><button onClick={load} disabled={loading} className="btn-soft"><RefreshCw className={loading ? 'animate-spin' : ''} size={16} /> Atualizar</button></div><div className="panel mt-5 overflow-hidden"><div className="border-b border-ink/8 p-5"><p className="font-extrabold">Solicitações pendentes</p><p className="mt-1 text-xs text-ink/40">A aprovação libera apenas a visualização da partida e do histórico.</p></div>{loading ? <div className="grid min-h-52 place-items-center"><div className="h-8 w-8 animate-spin rounded-full border-4 border-ink/10 border-t-turf-500" /></div> : profiles.length ? <div className="divide-y divide-ink/7">{profiles.map((profile) => <div key={profile.id} className="flex flex-col gap-4 p-5 sm:flex-row sm:items-center"><div className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-amber-100 text-amber-800"><Mail size={19} /></div><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{profile.email ?? 'E-mail não informado'}</p><p className="mt-1 text-xs text-ink/40">Solicitado {formatDistanceToNow(new Date(profile.criado_em), { addSuffix: true, locale: ptBR })}</p></div><select value={roles[profile.id] ?? 'normal'} onChange={(e) => setRoles((old) => ({ ...old, [profile.id]: e.target.value as 'normal' | 'admin' }))} className="input !min-h-9 !w-auto !py-1 text-xs"><option value="normal">Jogador</option><option value="admin">Administrador</option></select><div className="flex gap-2"><button disabled={busy === profile.id} onClick={() => reject(profile)} className="btn-soft flex-1 text-red-600 sm:flex-none"><UserX size={16} /> Rejeitar</button><button disabled={busy === profile.id} onClick={() => approve(profile)} className="btn-primary flex-1 sm:flex-none"><UserCheck size={16} /> Aprovar</button></div></div>)}</div> : <EmptyState icon={UserCheck} title="Tudo em dia" text="Não há novos cadastros aguardando sua decisão." />}</div></div>
 }
 
 function Dashboard({ players, checkins, teams, match, setView }: { players: Participante[]; checkins: CheckIn[]; teams: Time[]; match: Match | null; setView: (v: View) => void }) {
@@ -366,14 +431,19 @@ function Dashboard({ players, checkins, teams, match, setView }: { players: Part
   </div>
 }
 
-function Participants({ players, setPlayers, papel, userId }: { players: Participante[]; setPlayers: React.Dispatch<React.SetStateAction<Participante[]>>; papel: Papel | null; userId: string | null }) {
+function Participants({ players, setPlayers, papel, userId, rachaId }: { players: Participante[]; setPlayers: React.Dispatch<React.SetStateAction<Participante[]>>; papel: Papel | null; userId: string | null; rachaId: string | null }) {
   const blank = { nome: '', apelido: '', estrelas: 3, posicao: 'qualquer' as Posicao, foto_url: '' }
   const [form, setForm] = useState(blank)
   const [photo, setPhoto] = useState<File | null>(null)
   const [open, setOpen] = useState(false)
+  const [editingId, setEditingId] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [saving, setSaving] = useState(false)
   const meuParticipante = userId ? players.find((p) => p.perfil_id === userId) : undefined
+
+  const closeModal = () => { setOpen(false); setEditingId(null); setForm(blank); setPhoto(null) }
+  const openNew = () => { setForm(blank); setPhoto(null); setEditingId(null); setOpen(true) }
+  const openEdit = (p: Participante) => { setForm({ nome: p.nome, apelido: p.apelido ?? '', estrelas: p.estrelas, posicao: p.posicao, foto_url: p.foto_url ?? '' }); setPhoto(null); setEditingId(p.id); setOpen(true) }
 
   const resolvePhotoUrl = async () => {
     let photoUrl = form.foto_url || null
@@ -392,15 +462,27 @@ function Participants({ players, setPlayers, papel, userId }: { players: Partici
     if (!nome) return
     try {
       const photoUrl = await resolvePhotoUrl()
-      const player: Participante = { id: uid(), perfil_id: null, nome, apelido: form.apelido || null, estrelas: form.estrelas, posicao: form.posicao, foto_url: photoUrl, ativo: true }
-      if (supabase) {
-        const { data, error } = await supabase.from('participantes').insert({ nome: player.nome, apelido: player.apelido, estrelas: player.estrelas, posicao: player.posicao, foto_url: player.foto_url }).select().single()
-        if (error) throw new Error(error.message)
-        setPlayers((old) => [...old, data as Participante])
-      } else setPlayers((old) => [...old, player])
-      setForm(blank); setPhoto(null); setOpen(false); toast.success('Participante adicionado!')
+      if (editingId) {
+        const patch = { nome, apelido: form.apelido || null, estrelas: form.estrelas, posicao: form.posicao, foto_url: photoUrl }
+        if (supabase) {
+          const { data, error } = await supabase.from('participantes').update(patch).eq('id', editingId).select().single()
+          if (error) throw new Error(error.message)
+          setPlayers((old) => old.map((x) => x.id === editingId ? (data as Participante) : x))
+        } else setPlayers((old) => old.map((x) => x.id === editingId ? { ...x, ...patch } : x))
+        toast.success('Participante atualizado!')
+      } else {
+        const player: Participante = { id: uid(), perfil_id: null, nome, apelido: form.apelido || null, estrelas: form.estrelas, posicao: form.posicao, foto_url: photoUrl, ativo: true }
+        if (supabase) {
+          if (!rachaId) throw new Error('Racha não identificado.')
+          const { data, error } = await supabase.from('participantes').insert({ racha_id: rachaId, nome: player.nome, apelido: player.apelido, estrelas: player.estrelas, posicao: player.posicao, foto_url: player.foto_url }).select().single()
+          if (error) throw new Error(error.message)
+          setPlayers((old) => [...old, data as Participante])
+        } else setPlayers((old) => [...old, player])
+        toast.success('Participante adicionado!')
+      }
+      closeModal()
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Não foi possível adicionar o participante.')
+      toast.error(error instanceof Error ? error.message : 'Não foi possível salvar o participante.')
     }
   }
 
@@ -415,7 +497,8 @@ function Participants({ players, setPlayers, papel, userId }: { players: Partici
       const photoUrl = await resolvePhotoUrl()
       const player: Participante = { id: uid(), perfil_id: userId, nome, apelido: form.apelido || null, estrelas: 3, posicao: form.posicao, foto_url: photoUrl, ativo: true }
       if (supabase) {
-        const { data, error } = await supabase.from('participantes').insert({ nome: player.nome, apelido: player.apelido, posicao: player.posicao, foto_url: player.foto_url, estrelas: 3, perfil_id: userId }).select().single()
+        if (!rachaId) throw new Error('Racha não identificado.')
+        const { data, error } = await supabase.from('participantes').insert({ racha_id: rachaId, nome: player.nome, apelido: player.apelido, posicao: player.posicao, foto_url: player.foto_url, estrelas: 3, perfil_id: userId }).select().single()
         if (error) throw new Error(error.message)
         setPlayers((old) => old.some((p) => p.perfil_id === userId) ? old : [...old, data as Participante])
       } else setPlayers((old) => old.some((p) => p.perfil_id === userId) ? old : [...old, player])
@@ -434,15 +517,15 @@ function Participants({ players, setPlayers, papel, userId }: { players: Partici
     {meuParticipante ? <div className="panel overflow-hidden"><div className="border-b border-ink/8 bg-turf-50 p-5"><p className="text-lg font-extrabold">Seu perfil de jogador</p><p className="mt-1 text-sm text-ink/45">Este é o perfil vinculado à sua conta.</p></div><div className="flex items-center gap-5 p-6"><Avatar player={meuParticipante} size="lg" ring="#1FB8AE" /><div className="min-w-0"><p className="truncate text-xl font-black">{meuParticipante.nome}</p><p className="mt-1 text-sm font-semibold text-ink/50">{positionLabel[meuParticipante.posicao]}</p><div className="mt-2"><Stars value={meuParticipante.estrelas} /></div></div></div></div> : <div className="panel overflow-hidden"><div className="border-b border-ink/8 bg-turf-50 p-5"><p className="text-lg font-extrabold">Crie seu perfil de jogador</p><p className="mt-1 text-sm text-ink/45">Preencha seus dados uma única vez para entrar no elenco.</p></div><form onSubmit={saveSelf} className="p-5 md:p-6"><label className="label">Nome completo</label><input autoFocus className="input" value={form.nome} onChange={(e) => setForm({ ...form, nome: e.target.value })} placeholder="Ex: Carlos Eduardo" required /><label className="label mt-4">Apelido</label><input className="input" value={form.apelido} onChange={(e) => setForm({ ...form, apelido: e.target.value })} placeholder="Ex: Cadu" required /><p className="mt-1 text-xs text-ink/40">É o nome mostrado no campo durante a partida ao vivo.</p><label className="label mt-4">Posição</label><select className="input" value={form.posicao} onChange={(e) => setForm({ ...form, posicao: e.target.value as Posicao })}>{Object.entries(positionLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><label className="label mt-4">Foto <span className="normal-case tracking-normal text-ink/30">(opcional)</span></label><label className="flex min-h-20 cursor-pointer items-center justify-center rounded-xl border border-dashed border-ink/20 bg-ink/[.02] px-4 text-center text-sm font-semibold text-ink/50 hover:bg-turf-50"><input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" onChange={(e) => setPhoto(e.target.files?.[0] ?? null)} />{photo ? photo.name : 'Escolher foto do celular'}</label><button disabled={saving} className="btn-primary mt-6 w-full"><Check size={17} /> {saving ? 'Salvando...' : 'Criar meu perfil'}</button></form></div>}
   </div>
 
-  return <div><div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div><p className="text-sm text-ink/45">Cadastre e mantenha o elenco da pelada atualizado.</p><div className="mt-3 flex gap-2"><span className="chip bg-turf-100 text-turf-700">{players.filter((p) => p.ativo).length} ativos</span><span className="chip bg-ink/5 text-ink/50">{players.filter((p) => !p.ativo).length} inativos</span></div></div><button onClick={() => setOpen(true)} className="btn-primary"><UserPlus size={18} /> Novo participante</button></div>
-    <div className="panel mt-5 overflow-hidden"><div className="flex flex-col gap-3 border-b border-ink/8 p-4 sm:flex-row sm:items-center"><div className="relative max-w-md flex-1"><Search className="absolute left-3 top-3.5 text-ink/35" size={18} /><input className="input pl-10" placeholder="Buscar por nome..." value={search} onChange={(e) => setSearch(e.target.value)} /></div><span className="text-xs font-semibold text-ink/40">{visible.length} participantes</span></div><div className="divide-y divide-ink/7">{visible.map((p) => <div key={p.id} className={`flex items-center gap-3 p-4 transition ${!p.ativo ? 'opacity-45' : 'hover:bg-ink/[.02]'}`}><Avatar player={p} /><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{p.nome}</p><div className="mt-1 flex flex-wrap items-center gap-2"><span className="text-xs text-ink/45">{positionLabel[p.posicao]}</span><Stars value={p.estrelas} /></div></div><span className={`hidden sm:inline-flex chip ${p.ativo ? 'bg-turf-100 text-turf-700' : 'bg-ink/5 text-ink/45'}`}>{p.ativo ? 'Ativo' : 'Inativo'}</span><button onClick={() => toggle(p)} className="btn-soft !min-h-9 !px-3" title={p.ativo ? 'Desativar' : 'Reativar'}>{p.ativo ? <Trash2 size={15} /> : <RotateCcw size={15} />}</button></div>)}</div></div>
-    {open && <Modal title="Novo participante" onClose={() => setOpen(false)}><form onSubmit={saveAdmin}><label className="label">Nome completo</label><input autoFocus className="input" value={form.nome} onChange={(e) => setForm({ ...form, nome: e.target.value })} placeholder="Ex: Carlos Eduardo" required /><label className="label mt-4">Apelido <span className="normal-case tracking-normal text-ink/30">(opcional)</span></label><input className="input" value={form.apelido} onChange={(e) => setForm({ ...form, apelido: e.target.value })} placeholder="Ex: Cadu" /><div className="mt-4 grid grid-cols-2 gap-3"><div><label className="label">Posição</label><select className="input" value={form.posicao} onChange={(e) => setForm({ ...form, posicao: e.target.value as Posicao })}>{Object.entries(positionLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></div><div><label className="label">Nível</label><select className="input" value={form.estrelas} onChange={(e) => setForm({ ...form, estrelas: Number(e.target.value) })}>{[1,2,3,4,5].map((n) => <option key={n} value={n}>{'★'.repeat(n)} ({n})</option>)}</select></div></div><label className="label mt-4">Foto <span className="normal-case tracking-normal text-ink/30">(opcional)</span></label><label className="flex min-h-20 cursor-pointer items-center justify-center rounded-xl border border-dashed border-ink/20 bg-ink/[.02] px-4 text-center text-sm font-semibold text-ink/50 hover:bg-turf-50"><input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" onChange={(e) => setPhoto(e.target.files?.[0] ?? null)} />{photo ? photo.name : 'Escolher foto do celular'}</label><div className="mt-6 flex justify-end gap-2"><button type="button" className="btn-soft" onClick={() => setOpen(false)}>Cancelar</button><button className="btn-primary"><Check size={17} /> Salvar</button></div></form></Modal>}
+  return <div><div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div><p className="text-sm text-ink/45">Cadastre e mantenha o elenco da pelada atualizado.</p><div className="mt-3 flex gap-2"><span className="chip bg-turf-100 text-turf-700">{players.filter((p) => p.ativo).length} ativos</span><span className="chip bg-ink/5 text-ink/50">{players.filter((p) => !p.ativo).length} inativos</span></div></div><button onClick={openNew} className="btn-primary"><UserPlus size={18} /> Novo participante</button></div>
+    <div className="panel mt-5 overflow-hidden"><div className="flex flex-col gap-3 border-b border-ink/8 p-4 sm:flex-row sm:items-center"><div className="relative max-w-md flex-1"><Search className="absolute left-3 top-3.5 text-ink/35" size={18} /><input className="input pl-10" placeholder="Buscar por nome..." value={search} onChange={(e) => setSearch(e.target.value)} /></div><span className="text-xs font-semibold text-ink/40">{visible.length} participantes</span></div><div className="divide-y divide-ink/7">{visible.map((p) => <div key={p.id} className={`flex items-center gap-3 p-4 transition ${!p.ativo ? 'opacity-45' : 'hover:bg-ink/[.02]'}`}><Avatar player={p} /><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{p.nome}</p><div className="mt-1 flex flex-wrap items-center gap-2"><span className="text-xs text-ink/45">{positionLabel[p.posicao]}</span><Stars value={p.estrelas} /></div></div><span className={`hidden sm:inline-flex chip ${p.ativo ? 'bg-turf-100 text-turf-700' : 'bg-ink/5 text-ink/45'}`}>{p.ativo ? 'Ativo' : 'Inativo'}</span><button onClick={() => openEdit(p)} className="btn-soft !min-h-9 !px-3" title="Editar"><Pencil size={15} /></button><button onClick={() => toggle(p)} className="btn-soft !min-h-9 !px-3" title={p.ativo ? 'Desativar' : 'Reativar'}>{p.ativo ? <Trash2 size={15} /> : <RotateCcw size={15} />}</button></div>)}</div></div>
+    {open && <Modal title={editingId ? 'Editar participante' : 'Novo participante'} onClose={closeModal}><form onSubmit={saveAdmin}><label className="label">Nome completo</label><input autoFocus className="input" value={form.nome} onChange={(e) => setForm({ ...form, nome: e.target.value })} placeholder="Ex: Carlos Eduardo" required /><label className="label mt-4">Apelido <span className="normal-case tracking-normal text-ink/30">(opcional)</span></label><input className="input" value={form.apelido} onChange={(e) => setForm({ ...form, apelido: e.target.value })} placeholder="Ex: Cadu" /><div className="mt-4 grid grid-cols-2 gap-3"><div><label className="label">Posição</label><select className="input" value={form.posicao} onChange={(e) => setForm({ ...form, posicao: e.target.value as Posicao })}>{Object.entries(positionLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></div><div><label className="label">Nível</label><select className="input" value={form.estrelas} onChange={(e) => setForm({ ...form, estrelas: Number(e.target.value) })}>{[1,2,3,4,5].map((n) => <option key={n} value={n}>{'★'.repeat(n)} ({n})</option>)}</select></div></div><label className="label mt-4">Foto <span className="normal-case tracking-normal text-ink/30">(opcional)</span></label><label className="flex min-h-20 cursor-pointer items-center justify-center rounded-xl border border-dashed border-ink/20 bg-ink/[.02] px-4 text-center text-sm font-semibold text-ink/50 hover:bg-turf-50"><input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" onChange={(e) => setPhoto(e.target.files?.[0] ?? null)} />{photo ? photo.name : 'Escolher foto do celular'}</label><div className="mt-6 flex justify-end gap-2"><button type="button" className="btn-soft" onClick={closeModal}>Cancelar</button><button className="btn-primary"><Check size={17} /> {editingId ? 'Salvar alterações' : 'Salvar'}</button></div></form></Modal>}
   </div>
 }
 
-function Checkin({ players, checkins, setCheckins, sessionId, teamSize }: { players: Participante[]; checkins: CheckIn[]; setCheckins: React.Dispatch<React.SetStateAction<CheckIn[]>>; sessionId: string; teamSize: number }) {
+function Checkin({ players, checkins, setCheckins, sessionId, teamSize, rachaId }: { players: Participante[]; checkins: CheckIn[]; setCheckins: React.Dispatch<React.SetStateAction<CheckIn[]>>; sessionId: string; teamSize: number; rachaId: string | null }) {
   const [search, setSearch] = useState(''); const ids = new Set(checkins.map((c) => c.participante_id))
-  const toggle = async (p: Participante) => { const existing = checkins.find((c) => c.participante_id === p.id); if (existing) { setCheckins((old) => old.filter((c) => c.id !== existing.id)); if (supabase) { const { error } = await supabase.from('check_ins').delete().eq('id', existing.id); if (error) { setCheckins((old) => [...old, existing]); return toast.error(error.message) } } toast('Check-in desmarcado') } else { const item = { id: uid(), participante_id: p.id, horario_chegada: new Date().toISOString(), alocado: false }; if (supabase) { const { data, error } = await supabase.from('check_ins').insert({ sessao_id: sessionId, participante_id: p.id }).select().single(); if (error) return toast.error(error.message); setCheckins((old) => [...old, data as CheckIn]) } else setCheckins((old) => [...old, item]); toast.success(`${p.nome} chegou!`) } }
+  const toggle = async (p: Participante) => { const existing = checkins.find((c) => c.participante_id === p.id); if (existing) { setCheckins((old) => old.filter((c) => c.id !== existing.id)); if (supabase) { const { error } = await supabase.from('check_ins').delete().eq('id', existing.id); if (error) { setCheckins((old) => [...old, existing]); return toast.error(error.message) } } toast('Check-in desmarcado') } else { const item = { id: uid(), participante_id: p.id, horario_chegada: new Date().toISOString(), alocado: false }; if (supabase) { if (!rachaId) return toast.error('Racha não identificado.'); const { data, error } = await supabase.from('check_ins').insert({ sessao_id: sessionId, racha_id: rachaId, participante_id: p.id }).select().single(); if (error) return toast.error(error.message); setCheckins((old) => [...old, data as CheckIn]) } else setCheckins((old) => [...old, item]); toast.success(`${p.nome} chegou!`) } }
   const ordered = players.filter((p) => p.ativo && p.nome.toLowerCase().includes(search.toLowerCase())).sort((a, b) => Number(ids.has(b.id)) - Number(ids.has(a.id)))
   return <div><div className="grid gap-4 sm:grid-cols-3"><div className="panel col-span-2 flex items-center gap-4 p-5"><div className="grid h-14 w-14 place-items-center rounded-2xl bg-turf-100 text-turf-700"><ClipboardCheck size={27} /></div><div><p className="text-3xl font-black">{checkins.length}</p><p className="text-sm font-bold">jogadores presentes</p><p className="text-xs text-ink/40">{Math.floor(checkins.length / teamSize)} times de {teamSize} na linha possíveis</p></div></div><div className="panel hidden items-center gap-3 p-5 sm:flex"><Clock3 className="text-orange" /><div><p className="text-sm font-bold">Ordem de chegada</p><p className="text-xs text-ink/40">Usada como prioridade</p></div></div></div>
     <div className="panel mt-5 overflow-hidden"><div className="border-b border-ink/8 p-4"><div className="relative max-w-md"><Search className="absolute left-3 top-3.5 text-ink/35" size={18} /><input className="input pl-10" placeholder="Quem acabou de chegar?" value={search} onChange={(e) => setSearch(e.target.value)} /></div></div><div className="grid gap-px bg-ink/7 md:grid-cols-2">{ordered.map((p) => { const check = checkins.find((c) => c.participante_id === p.id); return <button key={p.id} onClick={() => toggle(p)} className={`flex items-center gap-3 bg-white p-4 text-left transition hover:bg-turf-50 ${check ? 'ring-2 ring-inset ring-turf-500/20' : ''}`}><Avatar player={p} /><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{p.nome}</p><p className="mt-1 text-xs text-ink/40">{positionLabel[p.posicao]} · {p.estrelas} estrelas</p></div>{check ? <div className="text-right"><span className="inline-grid h-8 w-8 place-items-center rounded-full bg-turf-500 text-white"><Check size={17} /></span><p className="mt-1 text-[10px] font-bold text-turf-700">{format(new Date(check.horario_chegada), 'HH:mm')}</p></div> : <span className="grid h-8 w-8 place-items-center rounded-full bg-ink/5 text-ink/30"><Plus size={17} /></span>}</button> })}</div></div>
@@ -532,7 +615,7 @@ function Draw({ players, checkins, setCheckins, teams, setTeams, teamSize, setTe
   </div>
 }
 
-function LiveMatch({ readOnly, teams, setTeams, players, match, setMatch, events, setEvents, sessionId, duration, status, sessionMatches, pendingDrawMatch, setPendingDrawMatch, onSessionFinished, onOpenDurationSettings }: { readOnly: boolean; teams: Time[]; setTeams: React.Dispatch<React.SetStateAction<Time[]>>; players: Participante[]; match: Match | null; setMatch: React.Dispatch<React.SetStateAction<Match | null>>; events: GolEvento[]; setEvents: React.Dispatch<React.SetStateAction<GolEvento[]>>; sessionId: string; duration: number; status: SessionStatus; sessionMatches: PartidaHistorica[]; pendingDrawMatch: Match | null; setPendingDrawMatch: React.Dispatch<React.SetStateAction<Match | null>>; onSessionFinished: () => void; onOpenDurationSettings: () => void }) {
+function LiveMatch({ readOnly, teams, setTeams, players, match, setMatch, events, setEvents, sessionId, rachaId, duration, status, sessionMatches, pendingDrawMatch, setPendingDrawMatch, onSessionFinished, onOpenDurationSettings }: { readOnly: boolean; teams: Time[]; setTeams: React.Dispatch<React.SetStateAction<Time[]>>; players: Participante[]; match: Match | null; setMatch: React.Dispatch<React.SetStateAction<Match | null>>; events: GolEvento[]; setEvents: React.Dispatch<React.SetStateAction<GolEvento[]>>; sessionId: string; rachaId: string | null; duration: number; status: SessionStatus; sessionMatches: PartidaHistorica[]; pendingDrawMatch: Match | null; setPendingDrawMatch: React.Dispatch<React.SetStateAction<Match | null>>; onSessionFinished: () => void; onOpenDurationSettings: () => void }) {
   const playing = teams.filter((t) => t.posicao_fila <= 2).sort((a,b) => a.posicao_fila - b.posicao_fila); const [seconds, setSeconds] = useState(duration * 60); const [assistFor, setAssistFor] = useState<{ player: Participante; team: Time; event: GolEvento } | null>(null); const [confirmEnd, setConfirmEnd] = useState(false)
   const [endSessionStep, setEndSessionStep] = useState<0 | 1 | 2>(0)
   const [endingSession, setEndingSession] = useState(false)
@@ -541,7 +624,7 @@ function LiveMatch({ readOnly, teams, setTeams, players, match, setMatch, events
   const [drawChoice, setDrawChoice] = useState<string[]>([])
   useEffect(() => { if (!match) { setSeconds(duration * 60); return } const calc = () => { const elapsed = match.timer_running && match.timer_started_at ? Math.floor((Date.now() - +new Date(match.timer_started_at)) / 1000) : 0; setSeconds(Math.max(0, match.timer_remaining_seconds - elapsed)) }; calc(); const id = setInterval(calc, 500); return () => clearInterval(id) }, [match, duration])
   const patchMatch = async (patch: Partial<Match>) => { if (readOnly) return; const previous = match; setMatch((old) => old ? { ...old, ...patch } : old); if (supabase && match) { const { error } = await supabase.from('partidas').update(patch).eq('id', match.id); if (error) { setMatch(previous); toast.error(error.message) } } }
-  const start = async () => { if (readOnly) return; if (playing.length < 2) return toast.error('Confirme ao menos dois times no sorteio.'); if (!match) { const item: Match = { id: uid(), time_a_id: playing[0].id, time_b_id: playing[1].id, placar_a: 0, placar_b: 0, status: 'em_andamento', horario_inicio: new Date().toISOString(), timer_started_at: new Date().toISOString(), timer_remaining_seconds: duration * 60, timer_running: true }; if (supabase) { const { data, error } = await supabase.from('partidas').insert({ sessao_id: sessionId, time_a_id: item.time_a_id, time_b_id: item.time_b_id, horario_inicio: item.horario_inicio, timer_started_at: item.timer_started_at, timer_remaining_seconds: item.timer_remaining_seconds, timer_running: true }).select().single(); if (error) return toast.error(error.message); setMatch(data as Match) } else setMatch(item); toast.success('Partida iniciada!') } else if (!match.timer_running) patchMatch({ timer_running: true, timer_started_at: new Date().toISOString(), timer_remaining_seconds: seconds }) }
+  const start = async () => { if (readOnly) return; if (playing.length < 2) return toast.error('Confirme ao menos dois times no sorteio.'); if (!match) { const item: Match = { id: uid(), time_a_id: playing[0].id, time_b_id: playing[1].id, placar_a: 0, placar_b: 0, status: 'em_andamento', horario_inicio: new Date().toISOString(), timer_started_at: new Date().toISOString(), timer_remaining_seconds: duration * 60, timer_running: true }; if (supabase) { if (!rachaId) return toast.error('Racha não identificado.'); const { data, error } = await supabase.from('partidas').insert({ sessao_id: sessionId, racha_id: rachaId, time_a_id: item.time_a_id, time_b_id: item.time_b_id, horario_inicio: item.horario_inicio, timer_started_at: item.timer_started_at, timer_remaining_seconds: item.timer_remaining_seconds, timer_running: true }).select().single(); if (error) return toast.error(error.message); setMatch(data as Match) } else setMatch(item); toast.success('Partida iniciada!') } else if (!match.timer_running) patchMatch({ timer_running: true, timer_started_at: new Date().toISOString(), timer_remaining_seconds: seconds }) }
   const pause = () => { if (!readOnly) patchMatch({ timer_running: false, timer_started_at: null, timer_remaining_seconds: seconds }) }
   const reset = () => { if (readOnly) return; setSeconds(duration * 60); patchMatch({ timer_running: false, timer_started_at: null, timer_remaining_seconds: duration * 60 }) }
 
@@ -605,7 +688,7 @@ function LiveMatch({ readOnly, teams, setTeams, players, match, setMatch, events
   const toggleDrawChoice = (teamId: string) => { setDrawChoice((old) => old.includes(teamId) ? old.filter((id) => id !== teamId) : old.length >= 2 ? old : [...old, teamId]) }
   const drawChoiceValid = drawChoice.length === 2 && !(drawTarget && drawChoice.includes(drawTarget.time_a_id) && drawChoice.includes(drawTarget.time_b_id))
   const confirmDrawChoice = () => { if (drawTarget && drawChoiceValid) void finalizarPartida(drawTarget, [drawChoice[0], drawChoice[1]]) }
-  const goal = async (player: Participante, team: Time) => { if (readOnly) return; if (!match) return toast.error('Inicie a partida antes de marcar gols.'); const side = match.time_a_id === team.id ? 'placar_a' : 'placar_b'; const novoPlacar = match[side] + 1; const ev: GolEvento = { id: uid(), partida_id: match.id, jogador_id: player.id, assistente_id: null, time_id: team.id, criado_em: new Date().toISOString() }; const next = { [side]: novoPlacar }; await patchMatch(next); if (supabase) { const { data, error } = await supabase.from('eventos').insert({ partida_id: match.id, jogador_id: player.id, time_id: team.id }).select().single(); if (error) return toast.error(error.message); setEvents((old) => [...old, data as GolEvento]); setAssistFor({ player, team, event: data as GolEvento }) } else { setEvents((old) => [...old, ev]); setAssistFor({ player, team, event: ev }) }; toast.success(`Gol de ${player.nome}! ⚽`); if (novoPlacar >= 2) void finalizarPartida({ ...match, ...next }) }
+  const goal = async (player: Participante, team: Time) => { if (readOnly) return; if (!match) return toast.error('Inicie a partida antes de marcar gols.'); const side = match.time_a_id === team.id ? 'placar_a' : 'placar_b'; const novoPlacar = match[side] + 1; const ev: GolEvento = { id: uid(), partida_id: match.id, jogador_id: player.id, assistente_id: null, time_id: team.id, criado_em: new Date().toISOString() }; const next = { [side]: novoPlacar }; await patchMatch(next); if (supabase) { if (!rachaId) return toast.error('Racha não identificado.'); const { data, error } = await supabase.from('eventos').insert({ partida_id: match.id, racha_id: rachaId, jogador_id: player.id, time_id: team.id }).select().single(); if (error) return toast.error(error.message); setEvents((old) => [...old, data as GolEvento]); setAssistFor({ player, team, event: data as GolEvento }) } else { setEvents((old) => [...old, ev]); setAssistFor({ player, team, event: ev }) }; toast.success(`Gol de ${player.nome}! ⚽`); if (novoPlacar >= 2) void finalizarPartida({ ...match, ...next }) }
   const assist = async (p: Participante | null) => { if (readOnly || !assistFor) return; if (p) { setEvents((old) => old.map((e) => e.id === assistFor.event.id ? { ...e, assistente_id: p.id } : e)); if (supabase) await supabase.from('eventos').update({ assistente_id: p.id }).eq('id', assistFor.event.id); toast.success(`Assistência de ${p.nome}`) } setAssistFor(null) }
   useEffect(() => { if (readOnly || !match || !match.timer_running || seconds > 0 || finishing || awaitingDrawChoice) return; attemptFinish(match) }, [seconds])
   const finishSession = async () => {
@@ -653,7 +736,7 @@ function MatchResultCard({ match, label }: { match: PartidaHistorica; label: str
   return <div className="rounded-2xl border border-ink/8 bg-white p-4"><p className="mb-4 text-center text-[10px] font-extrabold uppercase tracking-[.14em] text-ink/35">{label}</p><div className="grid items-center gap-4 md:grid-cols-[1fr_auto_1fr]"><HistoricalTeam team={match.time_a} names={teamPlayerNames(match.time_a)} strength={teamStrength(match.time_a)} /><div className="rounded-xl bg-ink px-4 py-2 text-center text-xl font-black text-white">{match.placar_a} × {match.placar_b}</div><HistoricalTeam team={match.time_b} names={teamPlayerNames(match.time_b)} strength={teamStrength(match.time_b)} right /></div></div>
 }
 
-function HistoryPage({ players }: { players: Participante[] }) {
+function HistoryPage({ players, rachaId }: { players: Participante[]; rachaId: string | null }) {
   const [allEvents, setAllEvents] = useState<GolEvento[]>([])
   const demoEvents = hasSupabase ? allEvents : [...Array(35)].map((_, i) => ({ id: `de${i}`, partida_id: 'old', jogador_id: players[i % 12].id, assistente_id: i % 3 ? players[(i + 3) % 12].id : null, time_id: 'old', criado_em: new Date().toISOString() }))
   const stats = rankings(players, demoEvents)
@@ -665,13 +748,13 @@ function HistoryPage({ players }: { players: Participante[] }) {
   const [eventsBySession, setEventsBySession] = useState<Record<string, GolEvento[]>>({})
 
   useEffect(() => {
-    if (!supabase) { setSessionsLoading(false); return }
+    if (!supabase || !rachaId) { setSessionsLoading(false); return }
     const db = supabase
     const load = async () => {
       const [sessionsResult, matchesResult, eventsResult] = await Promise.all([
-        db.from('sessoes').select('id,data,horario_fim,status').eq('status', 'finalizada').order('data', { ascending: false }),
-        db.from('partidas').select('sessao_id').eq('status', 'finalizada'),
-        db.from('eventos').select('*').order('criado_em'),
+        db.from('sessoes').select('id,data,horario_fim,status').eq('racha_id', rachaId).eq('status', 'finalizada').order('data', { ascending: false }),
+        db.from('partidas').select('sessao_id').eq('racha_id', rachaId).eq('status', 'finalizada'),
+        db.from('eventos').select('*').eq('racha_id', rachaId).order('criado_em'),
       ])
       if (sessionsResult.error || matchesResult.error) {
         toast.error('Não foi possível carregar as sessões anteriores.'); setSessionsLoading(false); return
@@ -683,7 +766,7 @@ function HistoryPage({ players }: { players: Participante[] }) {
       setSessionsLoading(false)
     }
     void load()
-  }, [])
+  }, [rachaId])
 
   const toggleSession = async (sessionId: string) => {
     if (expanded === sessionId) { setExpanded(null); return }

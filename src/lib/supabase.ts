@@ -10,6 +10,9 @@ export const supabase = hasSupabase ? createClient(url!, anonKey!, {
 }) : null
 
 export type Posicao = 'goleiro' | 'zagueiro' | 'meio' | 'atacante' | 'qualquer'
+export type Papel = 'admin' | 'normal' | 'pendente'
+export type Racha = { id: string; nome: string }
+export type RachaMembro = { racha_id: string; racha_nome: string; papel: Papel }
 export type Participante = { id: string; perfil_id: string | null; nome: string; apelido: string | null; foto_url: string | null; estrelas: number; posicao: Posicao; ativo: boolean }
 export type CheckIn = { id: string; participante_id: string; horario_chegada: string; alocado: boolean }
 export type Time = { id: string; numero: number; posicao_fila: number; status: 'na_fila' | 'jogando' | 'finalizado_no_dia'; forca_media: number | null; jogadores: Participante[] }
