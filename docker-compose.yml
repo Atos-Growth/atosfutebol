@@ -1,0 +1,14 @@
+# As variáveis vêm do .env desta pasta na VPS (não versionado).
+services:
+  atosfutebol-web:
+    build:
+      context: .
+      args:
+        VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:?defina no .env da VPS}
+        VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY:?defina no .env da VPS}
+    image: atosfutebol-web
+    container_name: atosfutebol-web
+    restart: unless-stopped
+    ports:
+      # 3091 e 3092 já são do expell/dedetizar — 3093 segue a sequência.
+      - "3093:80"
