@@ -9,6 +9,12 @@ services:
     image: atosfutebol-web
     container_name: atosfutebol-web
     restart: unless-stopped
-    ports:
-      # 3091 e 3092 já são do expell/dedetizar — 3093 segue a sequência.
-      - "3093:80"
+    # Sem porta publicada no host: quem entrega o app é o Nginx Proxy Manager,
+    # que alcança este container pelo nome dentro da npm_network. Mesmo padrão
+    # do app-tenis-web e do controle-faturamento-web.
+    networks:
+      - npm_network
+
+networks:
+  npm_network:
+    external: true
