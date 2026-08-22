@@ -149,10 +149,13 @@ function App() {
 
   const reloadPendingDraw = async (targetSessionId: string) => {
     if (!supabase) return
-    const { data: sessionRow } = await supabase.from('sessoes').select('pendente_escolha_partida_id').eq('id', targetSessionId).maybeSingle()
+    const { data: sessionRow, error } = await supabase.from('sessoes').select('pendente_escolha_partida_id').eq('id', targetSessionId).maybeSingle()
+    // Roda em realtime: o id no toast evita empilhar o mesmo aviso a cada evento.
+    if (error) { console.error('Falha ao ler a escolha pendente da sessão', error); toast.error(`Não foi possível verificar o empate pendente: ${error.message}`, { id: 'pendente-escolha' }); return }
     const pendingId = sessionRow?.pendente_escolha_partida_id ?? null
     if (!pendingId) { setPendingDrawMatch(null); return }
-    const { data: partidaRow } = await supabase.from('partidas').select('*').eq('id', pendingId).maybeSingle()
+    const { data: partidaRow, error: partidaError } = await supabase.from('partidas').select('*').eq('id', pendingId).maybeSingle()
+    if (partidaError) { console.error('Falha ao carregar a partida pendente', partidaError); toast.error(`Não foi possível carregar a partida do empate: ${partidaError.message}`, { id: 'pendente-escolha' }); return }
     setPendingDrawMatch((partidaRow as Match | null) ?? null)
   }
 
@@ -629,7 +632,7 @@ function LiveMatch({ readOnly, teams, setTeams, players, match, setMatch, events
   const [awaitingDrawChoice, setAwaitingDrawChoice] = useState(false)
   const [drawChoice, setDrawChoice] = useState<string[]>([])
   useEffect(() => { if (!match) { setSeconds(duration * 60); return } const calc = () => { const elapsed = match.timer_running && match.timer_started_at ? Math.floor((Date.now() - +new Date(match.timer_started_at)) / 1000) : 0; setSeconds(Math.max(0, match.timer_remaining_seconds - elapsed)) }; calc(); const id = setInterval(calc, 500); return () => clearInterval(id) }, [match, duration])
-  const patchMatch = async (patch: Partial<Match>) => { if (readOnly) return; const previous = match; setMatch((old) => old ? { ...old, ...patch } : old); if (supabase && match) { const { error } = await supabase.from('partidas').update(patch).eq('id', match.id); if (error) { setMatch(previous); toast.error(error.message) } } }
+  const patchMatch = async (patch: Partial<Match>): Promise<boolean> => { if (readOnly) return false; const previous = match; setMatch((old) => old ? { ...old, ...patch } : old); if (supabase && match) { const { error } = await supabase.from('partidas').update(patch).eq('id', match.id); if (error) { setMatch(previous); toast.error(error.message); return false } } return true }
   const start = async () => { if (readOnly) return; if (playing.length < 2) return toast.error('Confirme ao menos dois times no sorteio.'); if (!match) { const item: Match = { id: uid(), time_a_id: playing[0].id, time_b_id: playing[1].id, placar_a: 0, placar_b: 0, status: 'em_andamento', horario_inicio: new Date().toISOString(), timer_started_at: new Date().toISOString(), timer_remaining_seconds: duration * 60, timer_running: true }; if (supabase) { if (!rachaId) return toast.error('Racha não identificado.'); const { data, error } = await supabase.from('partidas').insert({ sessao_id: sessionId, racha_id: rachaId, time_a_id: item.time_a_id, time_b_id: item.time_b_id, horario_inicio: item.horario_inicio, timer_started_at: item.timer_started_at, timer_remaining_seconds: item.timer_remaining_seconds, timer_running: true }).select().single(); if (error) return toast.error(error.message); setMatch(data as Match) } else setMatch(item); toast.success('Partida iniciada!') } else if (!match.timer_running) patchMatch({ timer_running: true, timer_started_at: new Date().toISOString(), timer_remaining_seconds: seconds }) }
   const pause = () => { if (!readOnly) patchMatch({ timer_running: false, timer_started_at: null, timer_remaining_seconds: seconds }) }
   const reset = () => { if (readOnly) return; setSeconds(duration * 60); patchMatch({ timer_running: false, timer_started_at: null, timer_remaining_seconds: duration * 60 }) }
@@ -694,7 +697,29 @@ function LiveMatch({ readOnly, teams, setTeams, players, match, setMatch, events
   const toggleDrawChoice = (teamId: string) => { setDrawChoice((old) => old.includes(teamId) ? old.filter((id) => id !== teamId) : old.length >= 2 ? old : [...old, teamId]) }
   const drawChoiceValid = drawChoice.length === 2 && !(drawTarget && drawChoice.includes(drawTarget.time_a_id) && drawChoice.includes(drawTarget.time_b_id))
   const confirmDrawChoice = () => { if (drawTarget && drawChoiceValid) void finalizarPartida(drawTarget, [drawChoice[0], drawChoice[1]]) }
-  const goal = async (player: Participante, team: Time) => { if (readOnly) return; if (!match) return toast.error('Inicie a partida antes de marcar gols.'); const side = match.time_a_id === team.id ? 'placar_a' : 'placar_b'; const novoPlacar = match[side] + 1; const ev: GolEvento = { id: uid(), partida_id: match.id, jogador_id: player.id, assistente_id: null, time_id: team.id, criado_em: new Date().toISOString() }; const next = { [side]: novoPlacar }; await patchMatch(next); if (supabase) { if (!rachaId) return toast.error('Racha não identificado.'); const { data, error } = await supabase.from('eventos').insert({ partida_id: match.id, racha_id: rachaId, jogador_id: player.id, time_id: team.id }).select().single(); if (error) return toast.error(error.message); setEvents((old) => [...old, data as GolEvento]); setAssistFor({ player, team, event: data as GolEvento }) } else { setEvents((old) => [...old, ev]); setAssistFor({ player, team, event: ev }) }; toast.success(`Gol de ${player.nome}! ⚽`); if (novoPlacar >= 2) void finalizarPartida({ ...match, ...next }) }
+  const goal = async (player: Participante, team: Time) => {
+    if (readOnly) return
+    if (!match) return toast.error('Inicie a partida antes de marcar gols.')
+    if (supabase && !rachaId) return toast.error('Racha não identificado.')
+    const side = match.time_a_id === team.id ? 'placar_a' : 'placar_b'
+    const novoPlacar = match[side] + 1
+    const next = { [side]: novoPlacar }
+    // Se o placar não gravou, não registra o gol nem encerra: o estado do banco não mudou.
+    if (!(await patchMatch(next))) return
+    if (supabase) {
+      const { data, error } = await supabase.from('eventos').insert({ partida_id: match.id, racha_id: rachaId, jogador_id: player.id, time_id: team.id }).select().single()
+      // O placar já subiu no banco: o evento é só a autoria do gol. Se falhar,
+      // avisa e segue — senão a partida trava em 2 × 0 sem nunca encerrar.
+      if (error) toast.error(`Gol contado, mas não foi possível registrar o autor: ${error.message}`)
+      else { setEvents((old) => [...old, data as GolEvento]); setAssistFor({ player, team, event: data as GolEvento }) }
+    } else {
+      const ev: GolEvento = { id: uid(), partida_id: match.id, jogador_id: player.id, assistente_id: null, time_id: team.id, criado_em: new Date().toISOString() }
+      setEvents((old) => [...old, ev])
+      setAssistFor({ player, team, event: ev })
+    }
+    toast.success(`Gol de ${player.nome}! ⚽`)
+    if (novoPlacar >= 2) void finalizarPartida({ ...match, ...next })
+  }
   const assist = async (p: Participante | null) => { if (readOnly || !assistFor) return; if (p) { setEvents((old) => old.map((e) => e.id === assistFor.event.id ? { ...e, assistente_id: p.id } : e)); if (supabase) await supabase.from('eventos').update({ assistente_id: p.id }).eq('id', assistFor.event.id); toast.success(`Assistência de ${p.nome}`) } setAssistFor(null) }
   useEffect(() => { if (readOnly || !match || !match.timer_running || seconds > 0 || finishing || awaitingDrawChoice) return; attemptFinish(match) }, [seconds])
   const finishSession = async () => {
