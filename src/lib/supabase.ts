@@ -18,7 +18,9 @@ export type Participante = { id: string; perfil_id: string | null; nome: string;
 export type Fechamento = { participante_id: string; competencia: string; delta: number; partidas: number; gols: number; assistencias: number; estrelas_antes: number; estrelas_depois: number }
 export type CheckIn = { id: string; participante_id: string; horario_chegada: string; alocado: boolean }
 export type Time = { id: string; numero: number; posicao_fila: number; status: 'na_fila' | 'jogando' | 'finalizado_no_dia'; forca_media: number | null; jogadores: Participante[] }
-export type GolEvento = { id: string; partida_id: string; jogador_id: string; assistente_id: string | null; time_id: string; criado_em: string }
+// `contra` = gol contra: o ponto foi pro adversário, mas time_id continua sendo
+// o time de quem chutou. Opcional porque os dados de demonstração não têm.
+export type GolEvento = { id: string; partida_id: string; jogador_id: string; assistente_id: string | null; time_id: string; criado_em: string; contra?: boolean }
 
 export const initials = (name: string) => name.split(' ').slice(0, 2).map((word) => word[0]).join('').toUpperCase()
 export const positionLabel: Record<Posicao, string> = { goleiro: 'Goleiro', zagueiro: 'Zagueiro', meio: 'Meio', atacante: 'Atacante', qualquer: 'Qualquer' }
