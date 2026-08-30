@@ -5,10 +5,10 @@ import toast from 'react-hot-toast'
 import {
   ArrowLeftRight, ArrowUpRight, BarChart3, CalendarDays, Check, ChevronRight, CircleStop,
   ClipboardCheck, Clock3, Crown, History, LayoutDashboard, LogOut,
-  Menu, MessageCircle, Pause, Pencil, Play, Plus, RotateCcw, Search, Settings2, Shield,
-  Hourglass, Mail, RefreshCw, Shirt, Sparkles, Star, TimerReset, Trash2, Trophy, UserCheck, UserPlus, UserX, Users, X,
+  Menu, MessageCircle, Minus, Pause, Pencil, Play, Plus, RotateCcw, Search, Settings2, Shield,
+  Hourglass, Lock, Mail, RefreshCw, Shirt, Sparkles, Star, TimerReset, Trash2, TrendingDown, TrendingUp, Trophy, UserCheck, UserPlus, UserX, Users, X,
 } from 'lucide-react'
-import { CheckIn, GolEvento, hasSupabase, initials, Papel, Participante, positionLabel, Posicao, Racha, RachaMembro, supabase, Time } from './lib/supabase'
+import { CheckIn, Fechamento, GolEvento, hasSupabase, initials, Papel, Participante, positionLabel, Posicao, Racha, RachaMembro, supabase, Time } from './lib/supabase'
 
 type View = 'inicio' | 'participantes' | 'checkin' | 'sorteio' | 'partida' | 'historico' | 'aprovacoes'
 type SessionStatus = 'aguardando_checkin' | 'sorteando' | 'em_andamento' | 'finalizada'
@@ -48,6 +48,23 @@ function Avatar({ player, size = 'md', ring }: { player: Participante; size?: 's
 
 function Stars({ value }: { value: number }) {
   return <span className="inline-flex" aria-label={`${value} estrelas`}>{Array.from({ length: 5 }, (_, i) => <Star key={i} size={12} fill={i < value ? 'currentColor' : 'none'} className={i < value ? 'text-amber-400' : 'text-ink/15'} />)}</span>
+}
+
+// Seta do último fechamento mensal. Nunca mostra a pontuação crua: o jogador vê
+// estrelas e a direção em que está andando, não o número de 0 a 100.
+function Trend({ fechamento }: { fechamento?: Fechamento }) {
+  if (!fechamento) return null
+  const delta = Number(fechamento.delta)
+  const mudanca = fechamento.estrelas_depois - fechamento.estrelas_antes
+  const subiu = delta > 0.05
+  const caiu = delta < -0.05
+  const Icon = subiu ? TrendingUp : caiu ? TrendingDown : Minus
+  const tone = subiu ? 'text-turf-700' : caiu ? 'text-red-600' : 'text-ink/35'
+  const mes = format(new Date(`${fechamento.competencia}T12:00:00`), 'MMM', { locale: ptBR })
+  return <span className={`inline-flex items-center gap-1 text-[10px] font-bold ${tone}`} title={`${delta > 0 ? '+' : ''}${delta.toFixed(2)} no fechamento de ${mes} · ${fechamento.partidas} partidas, ${fechamento.gols} gols, ${fechamento.assistencias} assistências`}>
+    <Icon size={12} />{delta > 0 ? '+' : ''}{delta.toFixed(1)}
+    {mudanca !== 0 && <span className={`chip !px-1.5 !py-0 ${mudanca > 0 ? 'bg-turf-100 text-turf-700' : 'bg-red-100 text-red-700'}`}>{mudanca > 0 ? '↑' : '↓'} {fechamento.estrelas_depois}★</span>}
+  </span>
 }
 
 function EmptyState({ icon: Icon, title, text }: { icon: typeof Users; title: string; text: string }) {
@@ -91,6 +108,7 @@ function App() {
   const [memberships, setMemberships] = useState<RachaMembro[]>(hasSupabase ? [] : [{ racha_id: 'demo-racha', racha_nome: 'Racha demo', papel: 'admin' }])
   const [rachaAtivoId, setRachaAtivoIdState] = useState<string | null>(() => hasSupabase ? (typeof window === 'undefined' ? null : window.localStorage.getItem(RACHA_ATIVO_STORAGE_KEY)) : 'demo-racha')
   const [sessionReady, setSessionReady] = useState(!hasSupabase)
+  const [fechamentos, setFechamentos] = useState<Record<string, Fechamento>>({})
 
   const setRachaAtivoId = (id: string | null) => {
     setRachaAtivoIdState(id)
@@ -127,6 +145,26 @@ function App() {
   }
 
   useEffect(() => { void refreshMemberships() }, [userId])
+
+  // Vem ordenado do mais recente pro mais antigo: a primeira linha de cada
+  // jogador é o fechamento mais novo dele.
+  const loadFechamentos = async (targetRachaId: string) => {
+    if (!supabase) return
+    const { data, error } = await supabase.from('fechamentos_mensais')
+      .select('participante_id, competencia, delta, partidas, gols, assistencias, estrelas_antes, estrelas_depois')
+      .eq('racha_id', targetRachaId).order('competencia', { ascending: false })
+    if (error) { console.error('Falha ao carregar os fechamentos mensais', error); return }
+    const ultimos: Record<string, Fechamento> = {}
+    for (const linha of (data ?? []) as Fechamento[]) if (!ultimos[linha.participante_id]) ultimos[linha.participante_id] = linha
+    setFechamentos(ultimos)
+  }
+
+  const reloadElenco = async () => {
+    if (!supabase || !rachaAtivoId) return
+    const { data } = await supabase.from('participantes').select('*').eq('racha_id', rachaAtivoId).order('nome')
+    if (data) setPlayers(data as Participante[])
+    await loadFechamentos(rachaAtivoId)
+  }
 
   const loadSessionMatches = async (targetSessionId: string) => {
     if (!supabase) return
@@ -184,6 +222,7 @@ function App() {
     const load = async () => {
       const { data: participantData } = await db.from('participantes').select('*').eq('racha_id', rachaAtivoId).order('nome')
       if (participantData) setPlayers(participantData as Participante[])
+      await loadFechamentos(rachaAtivoId)
       const sessionQuery = await db.from('sessoes').select('*').eq('racha_id', rachaAtivoId).neq('status', 'finalizada').order('criado_em', { ascending: false }).limit(1).maybeSingle()
       if (sessionQuery.error) throw sessionQuery.error
       const sessionData = sessionQuery.data
@@ -285,7 +324,7 @@ function App() {
       <header className="flex h-20 items-center justify-between border-b border-ink/8 px-4 md:px-8"><div className="flex items-center gap-3"><button className="rounded-xl bg-white p-2.5 shadow-sm md:hidden" onClick={() => setMobileMenu(true)} aria-label="Abrir menu"><Menu size={20} /></button>{view !== 'inicio' && <div><p className="text-[11px] font-extrabold uppercase tracking-[.15em] text-turf-600">Pelada de hoje</p><h1 className="text-lg font-extrabold md:text-xl">{pageTitle[view]}</h1></div>}</div><div className="hidden items-center gap-3 sm:flex"><span className={`chip ${hasSupabase ? 'bg-turf-100 text-turf-700' : 'bg-amber-100 text-amber-800'}`}>{hasSupabase ? <><span className="h-1.5 w-1.5 rounded-full bg-turf-500" /> Sincronizado</> : 'Modo demo'}</span></div></header>
       <div className="mx-auto max-w-[1440px] p-4 pb-24 md:p-8">
         {view === 'inicio' && <Dashboard players={players} checkins={checkins} teams={teams} match={match} setView={setView} />}
-        {view === 'participantes' && <Participants players={players} setPlayers={setPlayers} papel={papel} userId={userId} rachaId={rachaAtivoId} />}
+        {view === 'participantes' && <Participants players={players} setPlayers={setPlayers} papel={papel} userId={userId} rachaId={rachaAtivoId} fechamentos={fechamentos} onRecarregar={reloadElenco} />}
         {view === 'checkin' && <Checkin players={players} checkins={checkins} setCheckins={setCheckins} sessionId={sessionId} teamSize={teamSize} rachaId={rachaAtivoId} />}
         {view === 'sorteio' && <Draw players={players} checkins={checkins} setCheckins={setCheckins} teams={teams} setTeams={setTeams} teamSize={teamSize} setTeamSize={setTeamSize} sessionId={sessionId} setStatus={setStatus} status={status} goLive={() => setView('partida')} />}
         {view === 'partida' && (!sessionReady ? <WaitingSession /> : <LiveMatch readOnly={papel === 'normal'} teams={teams} setTeams={setTeams} players={players} match={match} setMatch={setMatch} events={events} setEvents={setEvents} sessionId={sessionId} rachaId={rachaAtivoId} duration={duration} status={status} sessionMatches={sessionMatches} pendingDrawMatch={pendingDrawMatch} setPendingDrawMatch={setPendingDrawMatch} onSessionFinished={() => { setStatus('finalizada'); setView('historico'); void startNewSession() }} onOpenDurationSettings={() => setShowSettings(true)} />)}
@@ -440,19 +479,35 @@ function Dashboard({ players, checkins, teams, match, setView }: { players: Part
   </div>
 }
 
-function Participants({ players, setPlayers, papel, userId, rachaId }: { players: Participante[]; setPlayers: React.Dispatch<React.SetStateAction<Participante[]>>; papel: Papel | null; userId: string | null; rachaId: string | null }) {
-  const blank = { nome: '', apelido: '', estrelas: 3, posicao: 'qualquer' as Posicao, foto_url: '' }
+function Participants({ players, setPlayers, papel, userId, rachaId, fechamentos, onRecarregar }: { players: Participante[]; setPlayers: React.Dispatch<React.SetStateAction<Participante[]>>; papel: Papel | null; userId: string | null; rachaId: string | null; fechamentos: Record<string, Fechamento>; onRecarregar: () => Promise<void> }) {
+  const blank = { nome: '', apelido: '', estrelas: 3, posicao: 'qualquer' as Posicao, foto_url: '', estrelas_travadas: false }
   const [form, setForm] = useState(blank)
   const [photo, setPhoto] = useState<File | null>(null)
   const [open, setOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [saving, setSaving] = useState(false)
+  const [closingMonth, setClosingMonth] = useState(false)
   const meuParticipante = userId ? players.find((p) => p.perfil_id === userId) : undefined
+
+  // Antecipa o fechamento do mês corrente. O automático só dispara quando a
+  // primeira sessão do mês seguinte é aberta.
+  const fecharMes = async () => {
+    if (!supabase || !rachaId) return
+    if (!window.confirm('Fechar o mês agora? As estrelas serão recalculadas com tudo que foi registrado até hoje, e este mês não será fechado de novo.')) return
+    setClosingMonth(true)
+    const { data, error } = await supabase.rpc('fechar_mes_manual', { p_racha_id: rachaId, p_competencia: format(new Date(), 'yyyy-MM-dd') })
+    setClosingMonth(false)
+    if (error) return toast.error(error.message)
+    const avaliados = Number(data ?? 0)
+    if (!avaliados) return toast('Nada a fechar: o mês já foi fechado ou não há partidas registradas.')
+    toast.success(`Mês fechado — ${avaliados} ${avaliados === 1 ? 'jogador avaliado' : 'jogadores avaliados'}.`)
+    await onRecarregar()
+  }
 
   const closeModal = () => { setOpen(false); setEditingId(null); setForm(blank); setPhoto(null) }
   const openNew = () => { setForm(blank); setPhoto(null); setEditingId(null); setOpen(true) }
-  const openEdit = (p: Participante) => { setForm({ nome: p.nome, apelido: p.apelido ?? '', estrelas: p.estrelas, posicao: p.posicao, foto_url: p.foto_url ?? '' }); setPhoto(null); setEditingId(p.id); setOpen(true) }
+  const openEdit = (p: Participante) => { setForm({ nome: p.nome, apelido: p.apelido ?? '', estrelas: p.estrelas, posicao: p.posicao, foto_url: p.foto_url ?? '', estrelas_travadas: p.estrelas_travadas ?? false }); setPhoto(null); setEditingId(p.id); setOpen(true) }
 
   const resolvePhotoUrl = async () => {
     let photoUrl = form.foto_url || null
@@ -472,7 +527,7 @@ function Participants({ players, setPlayers, papel, userId, rachaId }: { players
     try {
       const photoUrl = await resolvePhotoUrl()
       if (editingId) {
-        const patch = { nome, apelido: form.apelido || null, estrelas: form.estrelas, posicao: form.posicao, foto_url: photoUrl }
+        const patch = { nome, apelido: form.apelido || null, estrelas: form.estrelas, posicao: form.posicao, foto_url: photoUrl, estrelas_travadas: form.estrelas_travadas }
         if (supabase) {
           const { data, error } = await supabase.from('participantes').update(patch).eq('id', editingId).select().single()
           if (error) throw new Error(error.message)
@@ -523,12 +578,12 @@ function Participants({ players, setPlayers, papel, userId, rachaId }: { players
   const visible = players.filter((p) => p.nome.toLowerCase().includes(search.toLowerCase()))
 
   if (papel === 'normal') return <div className="mx-auto max-w-2xl">
-    {meuParticipante ? <div className="panel overflow-hidden"><div className="border-b border-ink/8 bg-turf-50 p-5"><p className="text-lg font-extrabold">Seu perfil de jogador</p><p className="mt-1 text-sm text-ink/45">Este é o perfil vinculado à sua conta.</p></div><div className="flex items-center gap-5 p-6"><Avatar player={meuParticipante} size="lg" ring="#1FB8AE" /><div className="min-w-0"><p className="truncate text-xl font-black">{meuParticipante.nome}</p><p className="mt-1 text-sm font-semibold text-ink/50">{positionLabel[meuParticipante.posicao]}</p><div className="mt-2"><Stars value={meuParticipante.estrelas} /></div></div></div></div> : <div className="panel overflow-hidden"><div className="border-b border-ink/8 bg-turf-50 p-5"><p className="text-lg font-extrabold">Crie seu perfil de jogador</p><p className="mt-1 text-sm text-ink/45">Preencha seus dados uma única vez para entrar no elenco.</p></div><form onSubmit={saveSelf} className="p-5 md:p-6"><label className="label">Nome completo</label><input autoFocus className="input" value={form.nome} onChange={(e) => setForm({ ...form, nome: e.target.value })} placeholder="Ex: Carlos Eduardo" required /><label className="label mt-4">Apelido</label><input className="input" value={form.apelido} onChange={(e) => setForm({ ...form, apelido: e.target.value })} placeholder="Ex: Cadu" required /><p className="mt-1 text-xs text-ink/40">É o nome mostrado no campo durante a partida ao vivo.</p><label className="label mt-4">Posição</label><select className="input" value={form.posicao} onChange={(e) => setForm({ ...form, posicao: e.target.value as Posicao })}>{Object.entries(positionLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><label className="label mt-4">Foto <span className="normal-case tracking-normal text-ink/30">(opcional)</span></label><label className="flex min-h-20 cursor-pointer items-center justify-center rounded-xl border border-dashed border-ink/20 bg-ink/[.02] px-4 text-center text-sm font-semibold text-ink/50 hover:bg-turf-50"><input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" onChange={(e) => setPhoto(e.target.files?.[0] ?? null)} />{photo ? photo.name : 'Escolher foto do celular'}</label><button disabled={saving} className="btn-primary mt-6 w-full"><Check size={17} /> {saving ? 'Salvando...' : 'Criar meu perfil'}</button></form></div>}
+    {meuParticipante ? <div className="panel overflow-hidden"><div className="border-b border-ink/8 bg-turf-50 p-5"><p className="text-lg font-extrabold">Seu perfil de jogador</p><p className="mt-1 text-sm text-ink/45">Este é o perfil vinculado à sua conta.</p></div><div className="flex items-center gap-5 p-6"><Avatar player={meuParticipante} size="lg" ring="#1FB8AE" /><div className="min-w-0"><p className="truncate text-xl font-black">{meuParticipante.nome}</p><p className="mt-1 text-sm font-semibold text-ink/50">{positionLabel[meuParticipante.posicao]}</p><div className="mt-2 flex flex-wrap items-center gap-2"><Stars value={meuParticipante.estrelas} />{meuParticipante.estrelas_travadas ? <span className="chip bg-ink/5 text-ink/45"><Lock size={10} /> Congelado</span> : <Trend fechamento={fechamentos[meuParticipante.id]} />}</div><p className="mt-2 text-xs leading-relaxed text-ink/40">Seu nível é recalculado uma vez por mês, com base no desempenho de todos os domingos que você jogou.</p></div></div></div> : <div className="panel overflow-hidden"><div className="border-b border-ink/8 bg-turf-50 p-5"><p className="text-lg font-extrabold">Crie seu perfil de jogador</p><p className="mt-1 text-sm text-ink/45">Preencha seus dados uma única vez para entrar no elenco.</p></div><form onSubmit={saveSelf} className="p-5 md:p-6"><label className="label">Nome completo</label><input autoFocus className="input" value={form.nome} onChange={(e) => setForm({ ...form, nome: e.target.value })} placeholder="Ex: Carlos Eduardo" required /><label className="label mt-4">Apelido</label><input className="input" value={form.apelido} onChange={(e) => setForm({ ...form, apelido: e.target.value })} placeholder="Ex: Cadu" required /><p className="mt-1 text-xs text-ink/40">É o nome mostrado no campo durante a partida ao vivo.</p><label className="label mt-4">Posição</label><select className="input" value={form.posicao} onChange={(e) => setForm({ ...form, posicao: e.target.value as Posicao })}>{Object.entries(positionLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><label className="label mt-4">Foto <span className="normal-case tracking-normal text-ink/30">(opcional)</span></label><label className="flex min-h-20 cursor-pointer items-center justify-center rounded-xl border border-dashed border-ink/20 bg-ink/[.02] px-4 text-center text-sm font-semibold text-ink/50 hover:bg-turf-50"><input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" onChange={(e) => setPhoto(e.target.files?.[0] ?? null)} />{photo ? photo.name : 'Escolher foto do celular'}</label><button disabled={saving} className="btn-primary mt-6 w-full"><Check size={17} /> {saving ? 'Salvando...' : 'Criar meu perfil'}</button></form></div>}
   </div>
 
-  return <div><div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div><p className="text-sm text-ink/45">Cadastre e mantenha o elenco da pelada atualizado.</p><div className="mt-3 flex gap-2"><span className="chip bg-turf-100 text-turf-700">{players.filter((p) => p.ativo).length} ativos</span><span className="chip bg-ink/5 text-ink/50">{players.filter((p) => !p.ativo).length} inativos</span></div></div><button onClick={openNew} className="btn-primary"><UserPlus size={18} /> Novo participante</button></div>
-    <div className="panel mt-5 overflow-hidden"><div className="flex flex-col gap-3 border-b border-ink/8 p-4 sm:flex-row sm:items-center"><div className="relative max-w-md flex-1"><Search className="absolute left-3 top-3.5 text-ink/35" size={18} /><input className="input pl-10" placeholder="Buscar por nome..." value={search} onChange={(e) => setSearch(e.target.value)} /></div><span className="text-xs font-semibold text-ink/40">{visible.length} participantes</span></div><div className="divide-y divide-ink/7">{visible.map((p) => <div key={p.id} className={`flex items-center gap-3 p-4 transition ${!p.ativo ? 'opacity-45' : 'hover:bg-ink/[.02]'}`}><Avatar player={p} /><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{p.nome}</p><div className="mt-1 flex flex-wrap items-center gap-2"><span className="text-xs text-ink/45">{positionLabel[p.posicao]}</span><Stars value={p.estrelas} /></div></div><span className={`hidden sm:inline-flex chip ${p.ativo ? 'bg-turf-100 text-turf-700' : 'bg-ink/5 text-ink/45'}`}>{p.ativo ? 'Ativo' : 'Inativo'}</span><button onClick={() => openEdit(p)} className="btn-soft !min-h-9 !px-3" title="Editar"><Pencil size={15} /></button><button onClick={() => toggle(p)} className="btn-soft !min-h-9 !px-3" title={p.ativo ? 'Desativar' : 'Reativar'}>{p.ativo ? <Trash2 size={15} /> : <RotateCcw size={15} />}</button></div>)}</div></div>
-    {open && <Modal title={editingId ? 'Editar participante' : 'Novo participante'} onClose={closeModal}><form onSubmit={saveAdmin}><label className="label">Nome completo</label><input autoFocus className="input" value={form.nome} onChange={(e) => setForm({ ...form, nome: e.target.value })} placeholder="Ex: Carlos Eduardo" required /><label className="label mt-4">Apelido <span className="normal-case tracking-normal text-ink/30">(opcional)</span></label><input className="input" value={form.apelido} onChange={(e) => setForm({ ...form, apelido: e.target.value })} placeholder="Ex: Cadu" /><div className="mt-4 grid grid-cols-2 gap-3"><div><label className="label">Posição</label><select className="input" value={form.posicao} onChange={(e) => setForm({ ...form, posicao: e.target.value as Posicao })}>{Object.entries(positionLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></div><div><label className="label">Nível</label><select className="input" value={form.estrelas} onChange={(e) => setForm({ ...form, estrelas: Number(e.target.value) })}>{[1,2,3,4,5].map((n) => <option key={n} value={n}>{'★'.repeat(n)} ({n})</option>)}</select></div></div><label className="label mt-4">Foto <span className="normal-case tracking-normal text-ink/30">(opcional)</span></label><label className="flex min-h-20 cursor-pointer items-center justify-center rounded-xl border border-dashed border-ink/20 bg-ink/[.02] px-4 text-center text-sm font-semibold text-ink/50 hover:bg-turf-50"><input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" onChange={(e) => setPhoto(e.target.files?.[0] ?? null)} />{photo ? photo.name : 'Escolher foto do celular'}</label><div className="mt-6 flex justify-end gap-2"><button type="button" className="btn-soft" onClick={closeModal}>Cancelar</button><button className="btn-primary"><Check size={17} /> {editingId ? 'Salvar alterações' : 'Salvar'}</button></div></form></Modal>}
+  return <div><div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div><p className="text-sm text-ink/45">Cadastre e mantenha o elenco da pelada atualizado.</p><div className="mt-3 flex flex-wrap gap-2"><span className="chip bg-turf-100 text-turf-700">{players.filter((p) => p.ativo).length} ativos</span><span className="chip bg-ink/5 text-ink/50">{players.filter((p) => !p.ativo).length} inativos</span><span className="chip bg-amber-100 text-amber-800" title="O nível de cada jogador é recalculado no fechamento do mês">Níveis automáticos</span></div></div><div className="flex flex-wrap gap-2">{hasSupabase && <button onClick={fecharMes} disabled={closingMonth} className="btn-soft" title="Antecipa o fechamento do mês corrente. Normalmente ele roda sozinho quando a primeira sessão do mês seguinte é aberta."><CalendarDays size={17} /> {closingMonth ? 'Fechando...' : 'Fechar o mês'}</button>}<button onClick={openNew} className="btn-primary"><UserPlus size={18} /> Novo participante</button></div></div>
+    <div className="panel mt-5 overflow-hidden"><div className="flex flex-col gap-3 border-b border-ink/8 p-4 sm:flex-row sm:items-center"><div className="relative max-w-md flex-1"><Search className="absolute left-3 top-3.5 text-ink/35" size={18} /><input className="input pl-10" placeholder="Buscar por nome..." value={search} onChange={(e) => setSearch(e.target.value)} /></div><span className="text-xs font-semibold text-ink/40">{visible.length} participantes</span></div><div className="divide-y divide-ink/7">{visible.map((p) => <div key={p.id} className={`flex items-center gap-3 p-4 transition ${!p.ativo ? 'opacity-45' : 'hover:bg-ink/[.02]'}`}><Avatar player={p} /><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{p.nome}</p><div className="mt-1 flex flex-wrap items-center gap-2"><span className="text-xs text-ink/45">{positionLabel[p.posicao]}</span><Stars value={p.estrelas} />{p.estrelas_travadas ? <span className="chip bg-ink/5 text-ink/45" title="Nível congelado: o fechamento mensal não mexe nele"><Lock size={10} /> Congelado</span> : <Trend fechamento={fechamentos[p.id]} />}</div></div><span className={`hidden sm:inline-flex chip ${p.ativo ? 'bg-turf-100 text-turf-700' : 'bg-ink/5 text-ink/45'}`}>{p.ativo ? 'Ativo' : 'Inativo'}</span><button onClick={() => openEdit(p)} className="btn-soft !min-h-9 !px-3" title="Editar"><Pencil size={15} /></button><button onClick={() => toggle(p)} className="btn-soft !min-h-9 !px-3" title={p.ativo ? 'Desativar' : 'Reativar'}>{p.ativo ? <Trash2 size={15} /> : <RotateCcw size={15} />}</button></div>)}</div></div>
+    {open && <Modal title={editingId ? 'Editar participante' : 'Novo participante'} onClose={closeModal}><form onSubmit={saveAdmin}><label className="label">Nome completo</label><input autoFocus className="input" value={form.nome} onChange={(e) => setForm({ ...form, nome: e.target.value })} placeholder="Ex: Carlos Eduardo" required /><label className="label mt-4">Apelido <span className="normal-case tracking-normal text-ink/30">(opcional)</span></label><input className="input" value={form.apelido} onChange={(e) => setForm({ ...form, apelido: e.target.value })} placeholder="Ex: Cadu" /><div className="mt-4 grid grid-cols-2 gap-3"><div><label className="label">Posição</label><select className="input" value={form.posicao} onChange={(e) => setForm({ ...form, posicao: e.target.value as Posicao })}>{Object.entries(positionLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></div><div><label className="label">Nível inicial</label><select className="input" value={form.estrelas} onChange={(e) => setForm({ ...form, estrelas: Number(e.target.value) })}>{[1,2,3,4,5].map((n) => <option key={n} value={n}>{'★'.repeat(n)} ({n})</option>)}</select></div></div><p className="mt-2 text-xs leading-relaxed text-ink/45">{editingId ? 'Mudar o nível aqui reposiciona o jogador no meio da nova faixa e descarta o histórico de pontuação dele.' : 'É só o ponto de partida. A partir do primeiro fechamento mensal, o nível sobe ou desce sozinho conforme o desempenho.'}</p><label className="mt-4 flex cursor-pointer items-start gap-3 rounded-xl border border-ink/10 bg-ink/[.02] p-3.5"><input type="checkbox" className="mt-0.5 h-4 w-4 accent-turf-500" checked={form.estrelas_travadas} onChange={(e) => setForm({ ...form, estrelas_travadas: e.target.checked })} /><span><span className="block text-sm font-bold">Congelar o nível deste jogador</span><span className="mt-0.5 block text-xs leading-relaxed text-ink/45">O desempenho continua sendo registrado, mas o fechamento mensal não mexe no nível. Útil para quem está voltando de lesão.</span></span></label><label className="label mt-4">Foto <span className="normal-case tracking-normal text-ink/30">(opcional)</span></label><label className="flex min-h-20 cursor-pointer items-center justify-center rounded-xl border border-dashed border-ink/20 bg-ink/[.02] px-4 text-center text-sm font-semibold text-ink/50 hover:bg-turf-50"><input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" onChange={(e) => setPhoto(e.target.files?.[0] ?? null)} />{photo ? photo.name : 'Escolher foto do celular'}</label><div className="mt-6 flex justify-end gap-2"><button type="button" className="btn-soft" onClick={closeModal}>Cancelar</button><button className="btn-primary"><Check size={17} /> {editingId ? 'Salvar alterações' : 'Salvar'}</button></div></form></Modal>}
   </div>
 }
 
@@ -726,7 +781,9 @@ function LiveMatch({ readOnly, teams, setTeams, players, match, setMatch, events
     if (readOnly || endingSession) return
     setEndingSession(true)
     if (supabase) {
-      const { data, error } = await supabase.from('sessoes').update({ status: 'finalizada', horario_fim: new Date().toISOString() }).eq('id', sessionId).select('id').maybeSingle()
+      // A RPC encerra a sessão e registra o desempenho do dia na mesma
+      // transação. O ajuste de estrelas só acontece no fechamento do mês.
+      const { data, error } = await supabase.rpc('finalizar_sessao', { p_sessao_id: sessionId })
       if (error || !data) {
         setEndingSession(false)
         toast.error(`Não foi possível finalizar a sessão${error ? `: ${error.message}` : '.'}`)
