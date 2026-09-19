@@ -608,6 +608,60 @@ function shuffleEqualStarGroups(players: Participante[]) {
   return shuffled
 }
 
+// Pares que o sorteio nunca deixa no mesmo time. Aceita o id do participante ou
+// o id do perfil vinculado a ele.
+const PARES_SEPARADOS: [string, string][] = [
+  ['676a3acd-fb46-474d-a9be-d23fb6dcf811', '7b922a98-d68c-4f58-9f28-7989d7f8431e'],
+  ['676a3acd-fb46-474d-a9be-d23fb6dcf811', '879ea831-e04f-4c11-ae14-c0d9b45cdaa2'],
+]
+
+const mesmoJogador = (p: Participante, id: string) => p.id === id || p.perfil_id === id
+
+const contarConflitos = (teams: Time[]) => PARES_SEPARADOS.filter(([a, b]) => teams.some((t) => t.jogadores.some((p) => mesmoJogador(p, a)) && t.jogadores.some((p) => mesmoJogador(p, b)))).length
+
+const trocarJogadores = (origem: Time, destino: Time, sai: Participante, entra: Participante) => {
+  origem.jogadores = origem.jogadores.map((p) => p.id === sai.id ? entra : p)
+  destino.jogadores = destino.jogadores.map((p) => p.id === entra.id ? sai : p)
+}
+
+// Roda dentro do sorteio, antes de os times irem para a tela. Enquanto algum
+// par estiver junto, troca um dos dois por alguém de outro time, aceitando só
+// trocas que diminuem os conflitos sem criar outro — com vários pares
+// envolvendo o mesmo jogador, separar de um não pode juntar com o seguinte.
+// Entre as trocas válidas vence a de estrela mais próxima, para a força dos
+// times não mudar; empates são sorteados.
+function separarPares(teams: Time[]) {
+  for (let rodada = 0; rodada <= PARES_SEPARADOS.length; rodada++) {
+    const atuais = contarConflitos(teams)
+    if (!atuais) return
+    let candidatos: { origem: Time; destino: Time; sai: Participante; entra: Participante }[] = []
+    let melhor = { conflitos: atuais, diferenca: Infinity }
+    for (const [a, b] of PARES_SEPARADOS) {
+      const origem = teams.find((t) => t.jogadores.some((p) => mesmoJogador(p, a)) && t.jogadores.some((p) => mesmoJogador(p, b)))
+      if (!origem) continue
+      for (const sai of origem.jogadores.filter((p) => mesmoJogador(p, a) || mesmoJogador(p, b))) {
+        for (const destino of teams) {
+          if (destino === origem) continue
+          for (const entra of destino.jogadores) {
+            if ((entra.posicao === 'goleiro') !== (sai.posicao === 'goleiro')) continue
+            trocarJogadores(origem, destino, sai, entra)
+            const depois = contarConflitos(teams)
+            trocarJogadores(origem, destino, entra, sai)
+            if (depois >= atuais) continue
+            const diferenca = Math.abs(entra.estrelas - sai.estrelas)
+            const ehMelhor = depois < melhor.conflitos || (depois === melhor.conflitos && diferenca < melhor.diferenca)
+            if (ehMelhor) { melhor = { conflitos: depois, diferenca }; candidatos = [] }
+            if (ehMelhor || (depois === melhor.conflitos && diferenca === melhor.diferenca)) candidatos.push({ origem, destino, sai, entra })
+          }
+        }
+      }
+    }
+    if (!candidatos.length) return
+    const { origem, destino, sai, entra } = candidatos[Math.floor(Math.random() * candidatos.length)]
+    trocarJogadores(origem, destino, sai, entra)
+  }
+}
+
 function serpentineDraw(available: Participante[], teamSize: number): Time[] {
   const count = Math.floor(available.length / teamSize)
   if (count < 2) return []
@@ -633,6 +687,7 @@ function serpentineDraw(available: Participante[], teamSize: number): Time[] {
     result[index].jogadores.push(player)
     advance()
   }
+  separarPares(result)
   result.forEach((team) => { team.forca_media = Number((team.jogadores.reduce((sum, player) => sum + player.estrelas, 0) / team.jogadores.length).toFixed(2)) })
   return result
 }
