@@ -1,7 +1,9 @@
 # Build do Vite e nginx servindo o resultado — mesmo padrão dos outros
 # front-ends estáticos da VPS (atos-site, expell-dashboard, dedetizar).
 
-FROM node:20-alpine AS build
+# Node 24 LTS, a mesma versão do .nvmrc usada no CI. O Node 20 saiu de suporte
+# em abril de 2026.
+FROM node:24-alpine AS build
 WORKDIR /app
 
 # Copiado antes do resto para a camada de dependências ser reaproveitada

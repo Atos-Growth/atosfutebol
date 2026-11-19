@@ -1,0 +1,192 @@
+# CI do Atos Futebol — Fase A.
+#
+# Só valida. Não publica imagem, não faz deploy, não usa nenhum secret e não
+# conecta em Supabase nenhum (nem produção, nem homologação). Por isso roda com
+# segurança em PR de fork: o gatilho é `pull_request` (nunca
+# `pull_request_target`) e o GITHUB_TOKEN só tem leitura.
+#
+# Os nomes dos jobs (`name:`) são os que entram como checks obrigatórios na
+# proteção da main. Mudar um nome exige atualizar o ruleset junto
+# (docs/ci/protecao-da-main.md).
+#
+# Actions de terceiros: nenhuma. As do GitHub estão fixadas por SHA completo,
+# com a versão no comentário para o Dependabot/Renovate conseguir atualizar.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  NPM_CONFIG_UPDATE_NOTIFIER: 'false'
+
+jobs:
+  frontend:
+    name: Frontend (lint, tipos, testes, build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Node (versão do .nvmrc)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      # --ignore-scripts: código de PR não roda postinstall de dependência no
+      # runner. O esbuild funciona sem o postinstall (o binário vem pelo pacote
+      # opcional da plataforma); comprovado localmente com Node 24.
+      - name: Instalar dependências
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      # Teto igual aos 4 avisos atuais de react-hooks/exhaustive-deps: nenhum
+      # aviso novo entra. Baixar o número quando os atuais forem corrigidos.
+      - name: Lint
+        run: npm run lint -- --max-warnings 4
+
+      - name: Tipos
+        run: npx tsc -b
+
+      # A main ainda não tem script de teste; o Vitest chega com a branch de
+      # integração. Com --if-present o passo vira obrigatório sozinho quando o
+      # script aparecer.
+      - name: Testes
+        run: npm run test --if-present
+
+      # Sem VITE_SUPABASE_*: o bundle sai em modo demonstração. O objetivo aqui
+      # é provar que compila, não gerar artefato publicável.
+      - name: Build
+        run: npm run build
+
+  migrations:
+    name: Guarda de migrations
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout (histórico completo para o diff)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Node (versão do .nvmrc)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+
+      - name: Testes da guarda
+        run: node --test "scripts/ci/*.test.mjs"
+
+      # Análise estática: não aplica SQL e não exige baseline. As migrations
+      # 001–016 só são lidas para garantir que ninguém as altere.
+      - name: Verificar migrations novas e histórico
+        env:
+          GUARD_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: node scripts/ci/check-migrations.mjs
+
+  docker:
+    name: Docker (build sem publicar)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Valores fictícios só para passar no `test -n` do Dockerfile. Nenhuma
+      # chave real entra no CI; a imagem fica apenas no runner e é descartada.
+      - name: Build da imagem
+        run: >-
+          docker build --pull
+          --build-arg VITE_SUPABASE_URL=https://ci-placeholder.invalid
+          --build-arg VITE_SUPABASE_ANON_KEY=ci-placeholder-sem-valor
+          --tag atosfutebol-web:ci
+          .
+
+      - name: Smoke test do nginx
+        run: |
+          docker run --detach --name atosfutebol-web-ci --publish 127.0.0.1:8080:80 atosfutebol-web:ci
+          base=http://127.0.0.1:8080
+          for _ in $(seq 1 20); do curl -fsS -o /dev/null "$base/" && break; sleep 1; done
+
+          echo "1. index responde e tem o ponto de montagem do React"
+          curl -fsS "$base/" | grep -q '<div id="root">'
+
+          echo "2. index.html sem cache (é ele que aponta para o bundle novo)"
+          curl -fsSI "$base/index.html" | grep -qi '^cache-control: no-cache'
+
+          echo "3. rota desconhecida cai no index (SPA)"
+          curl -fsS "$base/rota/que/nao/existe" | grep -q '<div id="root">'
+
+          echo "4. asset com hash é servido com cache imutável"
+          asset=$(curl -fsS "$base/" | grep -o '/assets/[^"]*\.js' | head -n 1)
+          test -n "$asset"
+          curl -fsSI "$base$asset" | grep -qi '^cache-control:.*immutable'
+
+      - name: Remover container
+        if: always()
+        run: docker rm --force atosfutebol-web-ci || true
+
+  dependency-review:
+    name: Revisão de dependências
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Dependency review
+        uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
+        with:
+          fail-on-severity: high
+
+  workflows:
+    name: Lint dos workflows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      ACTIONLINT_VERSION: 1.7.12
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Binário oficial com checksum fixado, em vez de uma action de terceiro.
+      # O shellcheck já vem no runner e o actionlint o usa nos blocos `run`.
+      - name: actionlint
+        run: |
+          file="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLo "$RUNNER_TEMP/$file" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$file"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/$file" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$file" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color

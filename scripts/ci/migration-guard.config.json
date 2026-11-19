@@ -1,0 +1,24 @@
+{
+  "$comment": "Configuração da guarda de migrations (scripts/ci/check-migrations.mjs). sportsTables e internalData devem acompanhar o plano P0 da Janela 1 (docs/security/p0-technical-design-round4-3.md); ainda não conferido contra o documento, que não está disponível para a Janela 5.",
+  "migrationsDir": "supabase/migrations",
+  "newFilePattern": "^\\d{14}_[a-z0-9][a-z0-9_]*\\.sql$",
+  "sportsTables": [
+    "participantes",
+    "sessoes",
+    "check_ins",
+    "times",
+    "times_jogadores",
+    "partidas",
+    "eventos",
+    "avaliacoes_sessao",
+    "fechamentos_mensais"
+  ],
+  "$internalData": "Campos internos que não podem ser expostos a membros pela API (DEP-03 / INV-05). \"*\" = a tabela inteira é interna.",
+  "internalData": {
+    "participantes": ["pontuacao"],
+    "fechamentos_mensais": ["*"],
+    "avaliacoes_sessao": ["*"]
+  },
+  "$privilegedRoles": "Conceder a estes papéis não amplia o acesso de usuários do app.",
+  "privilegedRoles": ["service_role", "postgres", "supabase_admin"]
+}
