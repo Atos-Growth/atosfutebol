@@ -2,5 +2,18 @@ node_modules
 dist
 .env
 .env.local
+.env.*
+!.env.example
 *.log
 .DS_Store
+
+# Gerados pelo `tsc -b`. Ainda estão versionados: a remoção é um passo
+# separado, descrito em docs/ci/README.md ("Arquivos gerados no versionamento").
+# Atenção: vite.config.js tem precedência sobre vite.config.ts no Vite, então
+# ele precisa ser APAGADO, não só tirado do Git.
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+
+# Estado local da Supabase CLI (project ref, host do pooler, versões).
+supabase/.temp/
