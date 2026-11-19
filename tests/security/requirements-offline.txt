@@ -1,0 +1,2 @@
+# Parser only, not a PostgreSQL connection library. Install separately if needed.
+pglast==7.23
