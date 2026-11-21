@@ -1,9 +1,9 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import {
-  MY_PARTICIPANT_READ_V1, PARTICIPANT_MANAGEMENT_READ_V1,
-  parseMyParticipantV1, parseParticipantManagementBatchV1,
+  MY_PARTICIPANT_READ_V1, MY_PARTICIPANT_READ_V2, PARTICIPANT_MANAGEMENT_READ_V1,
+  parseMyParticipantV1, parseMyParticipantV2, parseParticipantManagementBatchV1,
 } from '../contracts/participant-context-v1.js'
-import type { MyParticipantV1, ParticipantManagementV1 } from '../contracts/participant-context-v1.js'
+import type { MyParticipantV1, MyParticipantV2, ParticipantManagementV1 } from '../contracts/participant-context-v1.js'
 import { ParticipantsReadError } from './participants-reader-v1.js'
 
 // Supplied user-session client. Role/profile identifiers are never RPC parameters.
@@ -40,6 +40,15 @@ export async function loadMyParticipantV1(client: ReadClient, request: Request):
   let query = client.rpc(MY_PARTICIPANT_READ_V1, { p_racha_id: tenant }, { get: true })
   if (request.signal) query = query.abortSignal(request.signal)
   return read(query, data => parseMyParticipantV1(data, tenant), request.signal)
+}
+
+/** Self-link plus the caller's own level state (regular member card). Same guarantees as v1. */
+export async function loadMyParticipantV2(client: ReadClient, request: Request): Promise<MyParticipantV2> {
+  const tenant = id(request.rachaId)
+  active(request.signal)
+  let query = client.rpc(MY_PARTICIPANT_READ_V2, { p_racha_id: tenant }, { get: true })
+  if (request.signal) query = query.abortSignal(request.signal)
+  return read(query, data => parseMyParticipantV2(data, tenant), request.signal)
 }
 
 /** Future organizer-only RPC. A client-side enum/tenant check does NOT authorize.

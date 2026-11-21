@@ -5,8 +5,16 @@ export const MY_PARTICIPANT_READ_V1 = 'obter_meu_participante_v1' as const
 export const PARTICIPANT_MANAGEMENT_READ_V1 = 'obter_gestao_participantes_v1' as const
 export const MY_PARTICIPANT_V1_FIELDS = ['racha_id', 'participante_id'] as const
 export const PARTICIPANT_MANAGEMENT_V1_FIELDS = ['racha_id', 'participante_id', 'nivel_estado'] as const
+/** v2: same self-link plus the caller's OWN level state (null exactly when unlinked). */
+export const MY_PARTICIPANT_READ_V2 = 'obter_meu_participante_v2' as const
+export const MY_PARTICIPANT_V2_FIELDS = ['racha_id', 'participante_id', 'nivel_estado'] as const
 
 export type MyParticipantV1 = Readonly<{ racha_id: string; participante_id: string | null }>
+export type MyParticipantV2 = Readonly<{
+  racha_id: string
+  participante_id: string | null
+  nivel_estado: 'automatico' | 'congelado' | null
+}>
 export type ParticipantManagementV1 = Readonly<{
   racha_id: string
   participante_id: string
@@ -48,6 +56,17 @@ export function parseMyParticipantV1(input: unknown, expectedRachaId: string): M
   return Object.freeze({
     racha_id: tenant(row, expectedRachaId),
     participante_id: row.participante_id === null ? null : uuid(row.participante_id),
+  })
+}
+
+/** Own state only. A linked participant always has a state; an unlinked one never does. */
+export function parseMyParticipantV2(input: unknown, expectedRachaId: string): MyParticipantV2 {
+  const row = record(input, MY_PARTICIPANT_V2_FIELDS)
+  const participante_id = row.participante_id === null ? null : uuid(row.participante_id)
+  const estado = row.nivel_estado
+  if (participante_id === null ? estado !== null : estado !== 'automatico' && estado !== 'congelado') invalid()
+  return Object.freeze({
+    racha_id: tenant(row, expectedRachaId), participante_id, nivel_estado: estado as MyParticipantV2['nivel_estado'],
   })
 }
 
