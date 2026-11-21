@@ -19,6 +19,8 @@ const participant = (id = P, tenant = A) => ({ id, racha_id: tenant, nome: 'Synt
   foto_url: null, posicao: 'meio', ativo: true, estrelas: 3 })
 const SELF_PATH = '/rest/v1/rpc/obter_meu_participante_v1'
 const MANAGEMENT_PATH = '/rest/v1/rpc/obter_gestao_participantes_v1'
+const SELF_V2_PATH = '/rest/v1/rpc/obter_meu_participante_v2'
+const selfV2 = (tenant = A, id = P, state = id === null ? null : 'automatico') => ({ ...self(tenant, id), nivel_estado: state })
 const actors = {
   memberA: 'synthetic-member-A', memberB: 'synthetic-member-B',
   adminA: 'synthetic-admin-A', adminB: 'synthetic-admin-B',
@@ -36,7 +38,7 @@ function fixture(handler, actor = actors.memberA) {
       const request = { url: new URL(String(input)), method: init.method, headers: new Headers(init.headers) }
       requests.push(request) // record even unexpected requests: SDK may catch fetch errors
       assert.equal(request.url.host, 'p0-offline-fixture.invalid')
-      assert.ok([SELF_PATH, MANAGEMENT_PATH].includes(request.url.pathname))
+      assert.ok([SELF_PATH, MANAGEMENT_PATH, SELF_V2_PATH].includes(request.url.pathname))
       assert.equal(init.method, 'GET')
       return handler(request, requests.length)
     } },
@@ -125,6 +127,35 @@ test('self SDK request uses only tenant parameter and the actual supplied sessio
     assert.equal(requests.length, 1)
     onlyRpc(requests, SELF_PATH, actor)
   }
+})
+
+test('self v2 contract carries only the caller own level state, consistent with the link', () => {
+  for (const value of [selfV2(A, P, 'automatico'), selfV2(A, P, 'congelado'), selfV2(A, null, null)]) {
+    const parsed = contract.parseMyParticipantV2(value, A)
+    assert.deepEqual(parsed, value)
+    assert.ok(Object.isFrozen(parsed))
+  }
+  for (const value of [selfV2(A, P, null), selfV2(A, null, 'automatico'), selfV2(A, P, 'travado'), selfV2(B),
+    self(), { ...selfV2(), perfil_id: 'CONFIDENTIAL_CANARY' }, { ...selfV2(), estrelas_travadas: true }, null, []]) {
+    assert.throws(() => contract.parseMyParticipantV2(value, A), contract.ParticipantContextContractError)
+  }
+})
+
+test('self v2 SDK request sends only the tenant; denial and malformed bodies never become unlinked', async () => {
+  const { client, requests } = fixture(({ url }) => {
+    assert.deepEqual([...url.searchParams.entries()], [['p_racha_id', A]])
+    return response(selfV2(A, P, 'congelado'))
+  })
+  assert.deepEqual(await api.loadMyParticipantV2(client, { rachaId: A }), selfV2(A, P, 'congelado'))
+  onlyRpc(requests, SELF_V2_PATH, actors.memberA)
+  const unlinked = fixture(() => response(selfV2(A, null, null)))
+  assert.deepEqual(await api.loadMyParticipantV2(unlinked.client, { rachaId: A }), selfV2(A, null, null))
+  for (const [body, status] of [[{ message: 'PARTICIPANT_CONTEXT_DENIED' }, 403], [null, 200], [selfV2(A, null, 'congelado'), 200]]) {
+    const denied = fixture(() => response(body, status))
+    await assert.rejects(api.loadMyParticipantV2(denied.client, { rachaId: A }),
+      errorCode(status === 200 ? 'INVALID_RESPONSE' : 'READ_FAILED'))
+  }
+  await assert.rejects(api.loadMyParticipantV2(client, { rachaId: 'bad' }), errorCode('INVALID_REQUEST'))
 })
 
 test('explicit authorized unlinked response is distinct from null envelope or HTTP denial', async () => {

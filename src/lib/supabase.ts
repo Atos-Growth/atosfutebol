@@ -13,7 +13,8 @@ export type Posicao = 'goleiro' | 'zagueiro' | 'meio' | 'atacante' | 'qualquer'
 export type Papel = 'admin' | 'normal' | 'pendente'
 export type Racha = { id: string; nome: string }
 export type RachaMembro = { racha_id: string; racha_nome: string; papel: Papel }
-export type Participante = { id: string; perfil_id: string | null; nome: string; apelido: string | null; foto_url: string | null; estrelas: number; posicao: Posicao; ativo: boolean; estrelas_travadas?: boolean }
+// Só campos públicos. Vínculo com a conta e estado de nível vêm das RPCs P0, nunca da linha.
+export type Participante = { id: string; nome: string; apelido: string | null; foto_url: string | null; estrelas: number; posicao: Posicao; ativo: boolean }
 // Último fechamento mensal de cada jogador: alimenta a seta de tendência.
 export type Fechamento = { participante_id: string; competencia: string; delta: number; partidas: number; gols: number; assistencias: number; estrelas_antes: number; estrelas_depois: number }
 export type CheckIn = { id: string; participante_id: string; horario_chegada: string; alocado: boolean }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { format, formatDistanceToNow } from 'date-fns'
 import { ptBR } from 'date-fns/locale'
 import toast from 'react-hot-toast'
@@ -9,14 +9,32 @@ import {
   Hourglass, Lock, Mail, RefreshCw, Shirt, Sparkles, Star, TimerReset, Trash2, TrendingDown, TrendingUp, Trophy, UserCheck, UserPlus, UserX, Users, X,
 } from 'lucide-react'
 import { CheckIn, Fechamento, GolEvento, hasSupabase, initials, Papel, Participante, positionLabel, Posicao, Racha, RachaMembro, supabase, Time } from './lib/supabase'
-import { loadMyParticipantV1, loadParticipantManagementV1 } from './data/participant-context-reader-v1'
+import { loadMyParticipantV2, loadParticipantManagementV1 } from './data/participant-context-reader-v1'
+import { loadParticipantsPageV1 } from './data/participants-reader-v1'
+import type { ParticipantsCursorV1 } from './data/participants-reader-v1'
 import type { ParticipantManagementV1 } from './contracts/participant-context-v1'
+import type { ParticipantPublicV1 } from './contracts/public-read-v1'
+import { selfCardState, settleRoster, startRoster } from './lib/participants-roster'
+import type { Roster, RosterStatus } from './lib/participants-roster'
 
-// Colunas que a UI usa de fato. Substitui o select('*'), que trazia também as colunas
-// internas de cálculo do nível. perfil_id/estrelas_travadas seguem aqui só para a regra
-// de pares do sorteio e o cartão do próprio jogador comum (pendentes, fora desta unidade).
-const PARTICIPANTE_COLUNAS = 'id, perfil_id, nome, apelido, foto_url, estrelas, posicao, ativo, estrelas_travadas'
+// Só colunas públicas de participantes (embeds e retornos de escrita). Vínculo com a
+// conta (perfil_id) e estado de nível (estrelas_travadas) vêm das RPCs P0.
+const PARTICIPANTE_COLUNAS = 'id, nome, apelido, foto_url, estrelas, posicao, ativo'
 type NivelEstado = ParticipantManagementV1['nivel_estado']
+const toParticipante = (p: ParticipantPublicV1): Participante => ({ id: p.id, nome: p.nome, apelido: p.apelido, foto_url: p.foto_url, estrelas: p.estrelas, posicao: p.posicao, ativo: p.ativo })
+
+// Lista completa da pelada pela leitura pública (view participantes_publicos_v1), em
+// páginas de 100 validadas pelo contrato. Mesma ordem por nome da consulta anterior.
+async function loadParticipantes(db: NonNullable<typeof supabase>, rachaId: string): Promise<Participante[]> {
+  const all: Participante[] = []
+  let cursor: ParticipantsCursorV1 | undefined
+  do {
+    const page = await loadParticipantsPageV1(db, { rachaId, pageSize: 100, cursor })
+    all.push(...page.items.map(toParticipante))
+    cursor = page.nextCursor ?? undefined
+  } while (cursor)
+  return all.sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'))
+}
 
 type View = 'inicio' | 'participantes' | 'checkin' | 'sorteio' | 'partida' | 'historico' | 'aprovacoes'
 type SessionStatus = 'aguardando_checkin' | 'sorteando' | 'em_andamento' | 'finalizada'
@@ -41,7 +59,7 @@ const demoPlayers: Participante[] = [
   ['Tiago Neves', 4, 'meio'], ['Edu Ramos', 3, 'qualquer'], ['Pedro Ivo', 5, 'atacante'], ['Léo Bahia', 3, 'zagueiro'],
   ['Nando Silva', 4, 'meio'], ['Vitor Sá', 2, 'atacante'], ['Dudu Castro', 3, 'qualquer'], ['Igor Freire', 4, 'zagueiro'],
   ['Samuel Braga', 3, 'meio'], ['Renan Lopes', 2, 'qualquer'],
-].map(([nome, estrelas, posicao], index) => ({ id: `p${index + 1}`, perfil_id: null, nome: String(nome), apelido: null, foto_url: null, estrelas: Number(estrelas), posicao: posicao as Posicao, ativo: true }))
+].map(([nome, estrelas, posicao], index) => ({ id: `p${index + 1}`, nome: String(nome), apelido: null, foto_url: null, estrelas: Number(estrelas), posicao: posicao as Posicao, ativo: true }))
 
 const demoCheckins: CheckIn[] = demoPlayers.slice(0, 19).map((p, index) => ({ id: `c${index}`, participante_id: p.id, horario_chegada: new Date(Date.now() - (80 - index * 3) * 60000).toISOString(), alocado: index < 18 }))
 
@@ -97,7 +115,14 @@ function App() {
     return validViews.includes(stored as View) ? (stored as View) : 'inicio'
   })
   useEffect(() => { window.localStorage.setItem(VIEW_STORAGE_KEY, view) }, [view])
-  const [players, setPlayers] = useState<Participante[]>(demoPlayers)
+  // Lista da pelada ativa com o status da carga. Com Supabase começa vazia: nunca exibe
+  // jogadores de demonstração nem de outra pelada enquanto carrega ou depois de um erro.
+  const [roster, setRoster] = useState<Roster<Participante>>(() => hasSupabase
+    ? { rachaId: null, status: 'loading', items: [] } : { rachaId: 'demo-racha', status: 'ready', items: demoPlayers })
+  const [rosterRetry, setRosterRetry] = useState(0)
+  const players = roster.items as Participante[]
+  const setPlayers = useCallback<React.Dispatch<React.SetStateAction<Participante[]>>>((update) => setRoster((r) => (
+    { ...r, items: typeof update === 'function' ? update(r.items as Participante[]) : update })), [])
   const [checkins, setCheckins] = useState<CheckIn[]>(demoCheckins)
   const [teams, setTeams] = useState<Time[]>([])
   const [events, setEvents] = useState<GolEvento[]>([])
@@ -217,12 +242,28 @@ function App() {
     return true
   }
 
+  // Lista de participantes em efeito próprio: falha não derruba a sessão, a lista anterior
+  // some na troca de pelada e resposta atrasada de outra pelada é descartada (settleRoster).
+  useEffect(() => {
+    if (!supabase || !authEmail || !papel || papel === 'pendente' || !rachaAtivoId) return
+    const db = supabase
+    const rachaId = rachaAtivoId
+    let cancelled = false
+    setRoster(startRoster<Participante>(rachaId))
+    loadParticipantes(db, rachaId).then(
+      (items) => { if (!cancelled) setRoster((r) => settleRoster(r, rachaId, { ok: true, items })) },
+      () => {
+        if (cancelled) return
+        setRoster((r) => settleRoster(r, rachaId, { ok: false }))
+        toast.error('Não foi possível carregar os participantes.')
+      })
+    return () => { cancelled = true }
+  }, [authEmail, papel, rachaAtivoId, rosterRetry])
+
   useEffect(() => {
     if (!supabase || !authEmail || !papel || papel === 'pendente' || !rachaAtivoId) return
     const db = supabase
     const load = async () => {
-      const { data: participantData } = await db.from('participantes').select(PARTICIPANTE_COLUNAS).eq('racha_id', rachaAtivoId).order('nome')
-      if (participantData) setPlayers(participantData as Participante[])
       await loadFechamentos(rachaAtivoId)
       const sessionQuery = await db.from('sessoes').select('*').eq('racha_id', rachaAtivoId).neq('status', 'finalizada').order('criado_em', { ascending: false }).limit(1).maybeSingle()
       if (sessionQuery.error) throw sessionQuery.error
@@ -238,7 +279,7 @@ function App() {
       setSessionReady(true); setSessionId(sessionData.id); setStatus(sessionData.status); setTeamSize(sessionData.tamanho_time); setDuration(sessionData.duracao_partida_minutos)
       const { data: checkData } = await db.from('check_ins').select('*').eq('sessao_id', sessionData.id).order('horario_chegada')
       setCheckins((checkData ?? []) as CheckIn[])
-      const { data: teamData } = await db.from('times').select('*, times_jogadores(participantes(*))').eq('sessao_id', sessionData.id).order('posicao_fila')
+      const { data: teamData } = await db.from('times').select(`*, times_jogadores(participantes(${PARTICIPANTE_COLUNAS}))`).eq('sessao_id', sessionData.id).order('posicao_fila')
       if (teamData) setTeams(teamData.map((t) => ({ ...t, jogadores: t.times_jogadores.map((j: { participantes: Participante }) => j.participantes) })) as Time[])
       const { data: matchData } = await db.from('partidas').select('*').eq('sessao_id', sessionData.id).eq('status', 'em_andamento').maybeSingle()
       setMatch((matchData as Match | null) ?? null)
@@ -256,7 +297,7 @@ function App() {
     if (!supabase || !sessionId || !sessionReady || !papel || papel === 'pendente') return
     const db = supabase
     const reloadTeams = async () => {
-      const { data } = await db.from('times').select('*, times_jogadores(participantes(*))').eq('sessao_id', sessionId).order('posicao_fila')
+      const { data } = await db.from('times').select(`*, times_jogadores(participantes(${PARTICIPANTE_COLUNAS}))`).eq('sessao_id', sessionId).order('posicao_fila')
       if (data) setTeams(data.map((t) => ({ ...t, jogadores: t.times_jogadores.map((j: { participantes: Participante }) => j.participantes) })) as Time[])
     }
     const reloadMatch = async () => {
@@ -325,7 +366,7 @@ function App() {
       <header className="flex h-20 items-center justify-between border-b border-ink/8 px-4 md:px-8"><div className="flex items-center gap-3"><button className="rounded-xl bg-white p-2.5 shadow-sm md:hidden" onClick={() => setMobileMenu(true)} aria-label="Abrir menu"><Menu size={20} /></button>{view !== 'inicio' && <div><p className="text-[11px] font-extrabold uppercase tracking-[.15em] text-turf-600">Pelada de hoje</p><h1 className="text-lg font-extrabold md:text-xl">{pageTitle[view]}</h1></div>}</div><div className="hidden items-center gap-3 sm:flex"><span className={`chip ${hasSupabase ? 'bg-turf-100 text-turf-700' : 'bg-amber-100 text-amber-800'}`}>{hasSupabase ? <><span className="h-1.5 w-1.5 rounded-full bg-turf-500" /> Sincronizado</> : 'Modo demo'}</span></div></header>
       <div className="mx-auto max-w-[1440px] p-4 pb-24 md:p-8">
         {view === 'inicio' && <Dashboard players={players} checkins={checkins} teams={teams} match={match} setView={setView} />}
-        {view === 'participantes' && <Participants players={players} setPlayers={setPlayers} papel={papel} userId={userId} rachaId={rachaAtivoId} fechamentos={fechamentos} />}
+        {view === 'participantes' && <Participants players={players} setPlayers={setPlayers} rosterStatus={roster.status} onRetryRoster={() => setRosterRetry((n) => n + 1)} papel={papel} userId={userId} rachaId={rachaAtivoId} fechamentos={fechamentos} />}
         {view === 'checkin' && <Checkin players={players} checkins={checkins} setCheckins={setCheckins} sessionId={sessionId} teamSize={teamSize} rachaId={rachaAtivoId} />}
         {view === 'sorteio' && <Draw players={players} checkins={checkins} setCheckins={setCheckins} teams={teams} setTeams={setTeams} teamSize={teamSize} setTeamSize={setTeamSize} sessionId={sessionId} setStatus={setStatus} status={status} goLive={() => setView('partida')} />}
         {view === 'partida' && (!sessionReady ? <WaitingSession /> : <LiveMatch readOnly={papel === 'normal'} teams={teams} setTeams={setTeams} players={players} match={match} setMatch={setMatch} events={events} setEvents={setEvents} sessionId={sessionId} rachaId={rachaAtivoId} duration={duration} status={status} sessionMatches={sessionMatches} pendingDrawMatch={pendingDrawMatch} setPendingDrawMatch={setPendingDrawMatch} onSessionFinished={() => { setStatus('finalizada'); setView('historico'); void startNewSession() }} onOpenDurationSettings={() => setShowSettings(true)} />)}
@@ -484,7 +525,7 @@ function Dashboard({ players, checkins, teams, match, setView }: { players: Part
 // deixaria os domingos restantes daquele mês gravados mas nunca contados, sem
 // aviso nenhum. O fechamento é só automático, na abertura da primeira sessão do
 // mês seguinte, e se falhar ele é retentado a cada nova sessão criada.
-function Participants({ players, setPlayers, papel, userId, rachaId, fechamentos }: { players: Participante[]; setPlayers: React.Dispatch<React.SetStateAction<Participante[]>>; papel: Papel | null; userId: string | null; rachaId: string | null; fechamentos: Record<string, Fechamento> }) {
+function Participants({ players, setPlayers, rosterStatus, onRetryRoster, papel, userId, rachaId, fechamentos }: { players: Participante[]; setPlayers: React.Dispatch<React.SetStateAction<Participante[]>>; rosterStatus: RosterStatus; onRetryRoster: () => void; papel: Papel | null; userId: string | null; rachaId: string | null; fechamentos: Record<string, Fechamento> }) {
   const blank = { nome: '', apelido: '', estrelas: 3, posicao: 'qualquer' as Posicao, foto_url: '', estrelas_travadas: false }
   const [form, setForm] = useState(blank)
   const [photo, setPhoto] = useState<File | null>(null)
@@ -493,24 +534,27 @@ function Participants({ players, setPlayers, papel, userId, rachaId, fechamentos
   const [search, setSearch] = useState('')
   const [saving, setSaving] = useState(false)
 
-  // Vínculo próprio derivado no servidor (obter_meu_participante_v1), não por perfil_id no
-  // cliente. Erro nunca vira "sem vínculo": o autocadastro só abre com resposta confirmada.
+  // Vínculo próprio e estado de nível SÓ do próprio jogador, derivados no servidor
+  // (obter_meu_participante_v2). Erro nunca vira "sem vínculo": o autocadastro só abre com
+  // resposta confirmada. No modo demonstração (sem Supabase) o vínculo é local.
   const selfKey = supabase && papel === 'normal' && rachaId && userId ? `${rachaId}:${userId}` : null
-  const [selfRead, setSelfRead] = useState<{ key: string; participanteId?: string | null; failed?: boolean } | null>(null)
+  const [selfRead, setSelfRead] = useState<{ key: string; participanteId?: string | null; nivel?: NivelEstado | null; failed?: boolean } | null>(null)
   const [selfRetry, setSelfRetry] = useState(0)
+  const [demoSelfId, setDemoSelfId] = useState<string | null>(null)
   useEffect(() => {
     if (!supabase || !selfKey || !rachaId) return
     const controller = new AbortController()
-    loadMyParticipantV1(supabase, { rachaId, signal: controller.signal })
-      .then((result) => setSelfRead({ key: selfKey, participanteId: result.participante_id }))
+    loadMyParticipantV2(supabase, { rachaId, signal: controller.signal })
+      .then((result) => setSelfRead({ key: selfKey, participanteId: result.participante_id, nivel: result.nivel_estado }))
       .catch(() => { if (!controller.signal.aborted) setSelfRead({ key: selfKey, failed: true }) })
     return () => controller.abort()
   }, [selfKey, rachaId, selfRetry])
   const selfStatus = !supabase ? 'local' : !selfKey ? 'idle' : selfRead?.key !== selfKey ? 'loading' : selfRead.failed ? 'error' : 'ready'
   const selfParticipanteId = selfStatus === 'ready' ? selfRead?.participanteId ?? null : null
   const meuParticipante = selfStatus === 'local'
-    ? (userId ? players.find((p) => p.perfil_id === userId) : undefined)
+    ? (demoSelfId ? players.find((p) => p.id === demoSelfId) : undefined)
     : selfParticipanteId ? players.find((p) => p.id.toLowerCase() === selfParticipanteId) : undefined
+  const meuNivelCongelado = selfStatus === 'ready' && selfRead?.nivel === 'congelado'
   const retrySelf = () => { setSelfRead(null); setSelfRetry((n) => n + 1) }
 
   // Estado de nível (congelado/automático) só pelo contrato de gestão, autorizado no servidor
@@ -539,7 +583,8 @@ function Participants({ players, setPlayers, papel, userId, rachaId, fechamentos
     return () => controller.abort()
   }, [nivelKey, rachaId, playerIds, nivelRetry])
   const nivelStatus = !supabase ? 'local' : !nivelKey ? 'idle' : nivelRead?.key !== nivelKey ? 'loading' : nivelRead.failed ? 'error' : 'ready'
-  const congelado = (p: Participante) => nivelStatus === 'local' ? Boolean(p.estrelas_travadas) : nivelRead?.niveis?.[p.id.toLowerCase()] === 'congelado'
+  const [localNiveis, setLocalNiveis] = useState<Record<string, NivelEstado>>({})
+  const congelado = (p: Participante) => (nivelStatus === 'local' ? localNiveis[p.id] : nivelRead?.niveis?.[p.id.toLowerCase()]) === 'congelado'
   const retryNivel = () => { setNivelRead(null); setNivelRetry((n) => n + 1) }
 
   const closeModal = () => { setOpen(false); setEditingId(null); setForm(blank); setPhoto(null) }
@@ -568,20 +613,23 @@ function Participants({ players, setPlayers, papel, userId, rachaId, fechamentos
     try {
       const photoUrl = await resolvePhotoUrl()
       if (editingId) {
-        const patch = { nome, apelido: form.apelido || null, estrelas: form.estrelas, posicao: form.posicao, foto_url: photoUrl, estrelas_travadas: form.estrelas_travadas }
+        const dados = { nome, apelido: form.apelido || null, estrelas: form.estrelas, posicao: form.posicao, foto_url: photoUrl }
+        const salvo: NivelEstado = form.estrelas_travadas ? 'congelado' : 'automatico'
         if (supabase) {
-          const { data, error } = await supabase.from('participantes').update(patch).eq('id', editingId).select().single()
+          const { data, error } = await supabase.from('participantes').update({ ...dados, estrelas_travadas: form.estrelas_travadas }).eq('id', editingId).select(PARTICIPANTE_COLUNAS).single()
           if (error) throw new Error(error.message)
           setPlayers((old) => old.map((x) => x.id === editingId ? (data as Participante) : x))
-          const salvo: NivelEstado = form.estrelas_travadas ? 'congelado' : 'automatico'
           setNivelRead((r) => r?.niveis ? { ...r, niveis: { ...r.niveis, [editingId.toLowerCase()]: salvo } } : r)
-        } else setPlayers((old) => old.map((x) => x.id === editingId ? { ...x, ...patch } : x))
+        } else {
+          setPlayers((old) => old.map((x) => x.id === editingId ? { ...x, ...dados } : x))
+          setLocalNiveis((n) => ({ ...n, [editingId]: salvo }))
+        }
         toast.success('Participante atualizado!')
       } else {
-        const player: Participante = { id: uid(), perfil_id: null, nome, apelido: form.apelido || null, estrelas: form.estrelas, posicao: form.posicao, foto_url: photoUrl, ativo: true }
+        const player: Participante = { id: uid(), nome, apelido: form.apelido || null, estrelas: form.estrelas, posicao: form.posicao, foto_url: photoUrl, ativo: true }
         if (supabase) {
           if (!rachaId) throw new Error('Racha não identificado.')
-          const { data, error } = await supabase.from('participantes').insert({ racha_id: rachaId, nome: player.nome, apelido: player.apelido, estrelas: player.estrelas, posicao: player.posicao, foto_url: player.foto_url }).select().single()
+          const { data, error } = await supabase.from('participantes').insert({ racha_id: rachaId, nome: player.nome, apelido: player.apelido, estrelas: player.estrelas, posicao: player.posicao, foto_url: player.foto_url }).select(PARTICIPANTE_COLUNAS).single()
           if (error) throw new Error(error.message)
           setPlayers((old) => [...old, data as Participante])
         } else setPlayers((old) => [...old, player])
@@ -603,15 +651,16 @@ function Participants({ players, setPlayers, papel, userId, rachaId, fechamentos
     setSaving(true)
     try {
       const photoUrl = await resolvePhotoUrl()
-      const player: Participante = { id: uid(), perfil_id: userId, nome, apelido: form.apelido || null, estrelas: 3, posicao: form.posicao, foto_url: photoUrl, ativo: true }
+      const player: Participante = { id: uid(), nome, apelido: form.apelido || null, estrelas: 3, posicao: form.posicao, foto_url: photoUrl, ativo: true }
       if (supabase) {
         if (!rachaId) throw new Error('Racha não identificado.')
-        const { data, error } = await supabase.from('participantes').insert({ racha_id: rachaId, nome: player.nome, apelido: player.apelido, posicao: player.posicao, foto_url: player.foto_url, estrelas: 3, perfil_id: userId }).select().single()
+        // perfil_id só é escrito (vínculo da própria conta, conferido pela policy); nunca lido de volta.
+        const { data, error } = await supabase.from('participantes').insert({ racha_id: rachaId, nome: player.nome, apelido: player.apelido, posicao: player.posicao, foto_url: player.foto_url, estrelas: 3, perfil_id: userId }).select(PARTICIPANTE_COLUNAS).single()
         if (error) throw new Error(error.message)
         const criado = data as Participante
         setPlayers((old) => old.some((p) => p.id === criado.id) ? old : [...old, criado])
-        if (selfKey) setSelfRead({ key: selfKey, participanteId: criado.id.toLowerCase() })
-      } else setPlayers((old) => old.some((p) => p.perfil_id === userId) ? old : [...old, player])
+        if (selfKey) setSelfRead({ key: selfKey, participanteId: criado.id.toLowerCase(), nivel: 'automatico' })
+      } else if (!demoSelfId) { setPlayers((old) => [...old, player]); setDemoSelfId(player.id) }
       setForm(blank); setPhoto(null); toast.success('Seu perfil de jogador foi criado!')
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Não foi possível criar seu perfil de jogador.')
@@ -623,11 +672,23 @@ function Participants({ players, setPlayers, papel, userId, rachaId, fechamentos
   const toggle = async (p: Participante) => { const previous = p.ativo; setPlayers((old) => old.map((x) => x.id === p.id ? { ...x, ativo: !x.ativo } : x)); if (supabase) { const { error } = await supabase.from('participantes').update({ ativo: !p.ativo }).eq('id', p.id); if (error) { setPlayers((old) => old.map((x) => x.id === p.id ? { ...x, ativo: previous } : x)); toast.error(error.message) } } }
   const visible = players.filter((p) => p.nome.toLowerCase().includes(search.toLowerCase()))
 
-  if (papel === 'normal') return <div className="mx-auto max-w-2xl">
-    {selfStatus === 'loading' || (selfParticipanteId && !meuParticipante) ? <div className="panel grid min-h-40 place-items-center p-8 text-center text-sm font-semibold text-ink/45">Carregando seu perfil de jogador...</div>
-    : selfStatus === 'error' ? <div className="panel p-6 text-center"><p className="font-bold">Não foi possível confirmar seu perfil agora</p><p className="mt-1 text-sm text-ink/45">Verifique sua conexão e tente novamente.</p><button onClick={retrySelf} className="btn-soft mt-4"><RefreshCw size={16} /> Tentar de novo</button></div>
-    : meuParticipante ? <div className="panel overflow-hidden"><div className="border-b border-ink/8 bg-turf-50 p-5"><p className="text-lg font-extrabold">Seu perfil de jogador</p><p className="mt-1 text-sm text-ink/45">Este é o perfil vinculado à sua conta.</p></div><div className="flex items-center gap-5 p-6"><Avatar player={meuParticipante} size="lg" ring="#1FB8AE" /><div className="min-w-0"><p className="truncate text-xl font-black">{meuParticipante.nome}</p><p className="mt-1 text-sm font-semibold text-ink/50">{positionLabel[meuParticipante.posicao]}</p><div className="mt-2 flex flex-wrap items-center gap-2"><Stars value={meuParticipante.estrelas} />{meuParticipante.estrelas_travadas ? <span className="chip bg-ink/5 text-ink/45"><Lock size={10} /> Congelado</span> : <Trend fechamento={fechamentos[meuParticipante.id]} />}</div><p className="mt-2 text-xs leading-relaxed text-ink/40">Seu nível é recalculado uma vez por mês, com base no desempenho de todos os domingos que você jogou.</p></div></div></div> : <div className="panel overflow-hidden"><div className="border-b border-ink/8 bg-turf-50 p-5"><p className="text-lg font-extrabold">Crie seu perfil de jogador</p><p className="mt-1 text-sm text-ink/45">Preencha seus dados uma única vez para entrar no elenco.</p></div><form onSubmit={saveSelf} className="p-5 md:p-6"><label className="label">Nome completo</label><input autoFocus className="input" value={form.nome} onChange={(e) => setForm({ ...form, nome: e.target.value })} placeholder="Ex: Carlos Eduardo" required /><label className="label mt-4">Apelido</label><input className="input" value={form.apelido} onChange={(e) => setForm({ ...form, apelido: e.target.value })} placeholder="Ex: Cadu" required /><p className="mt-1 text-xs text-ink/40">É o nome mostrado no campo durante a partida ao vivo.</p><label className="label mt-4">Posição</label><select className="input" value={form.posicao} onChange={(e) => setForm({ ...form, posicao: e.target.value as Posicao })}>{Object.entries(positionLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><label className="label mt-4">Foto <span className="normal-case tracking-normal text-ink/30">(opcional)</span></label><label className="flex min-h-20 cursor-pointer items-center justify-center rounded-xl border border-dashed border-ink/20 bg-ink/[.02] px-4 text-center text-sm font-semibold text-ink/50 hover:bg-turf-50"><input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" onChange={(e) => setPhoto(e.target.files?.[0] ?? null)} />{photo ? photo.name : 'Escolher foto do celular'}</label><button disabled={saving} className="btn-primary mt-6 w-full"><Check size={17} /> {saving ? 'Salvando...' : 'Criar meu perfil'}</button></form></div>}
+  const errorPanel = (title: string, retry: () => void) => <div className="panel p-6 text-center"><p className="font-bold">{title}</p><p className="mt-1 text-sm text-ink/45">Verifique sua conexão e tente novamente.</p><button onClick={retry} className="btn-soft mt-4"><RefreshCw size={16} /> Tentar de novo</button></div>
+  const loadingPanel = (text: string) => <div className="panel grid min-h-40 place-items-center p-8 text-center text-sm font-semibold text-ink/45">{text}</div>
+
+  if (papel === 'normal') {
+    const card = selfCardState({ rosterStatus, selfStatus, selfParticipanteId, selfInList: Boolean(meuParticipante) })
+    return <div className="mx-auto max-w-2xl">
+    {card === 'loading' ? loadingPanel('Carregando seu perfil de jogador...')
+    : card === 'self-error' ? errorPanel('Não foi possível confirmar seu perfil agora', retrySelf)
+    : card === 'list-error' ? errorPanel('Não foi possível carregar a lista de participantes', onRetryRoster)
+    : card === 'missing-self' ? errorPanel('Seu perfil não apareceu na lista de participantes', () => { retrySelf(); onRetryRoster() })
+    : card === 'linked' && meuParticipante ? <div className="panel overflow-hidden"><div className="border-b border-ink/8 bg-turf-50 p-5"><p className="text-lg font-extrabold">Seu perfil de jogador</p><p className="mt-1 text-sm text-ink/45">Este é o perfil vinculado à sua conta.</p></div><div className="flex items-center gap-5 p-6"><Avatar player={meuParticipante} size="lg" ring="#1FB8AE" /><div className="min-w-0"><p className="truncate text-xl font-black">{meuParticipante.nome}</p><p className="mt-1 text-sm font-semibold text-ink/50">{positionLabel[meuParticipante.posicao]}</p><div className="mt-2 flex flex-wrap items-center gap-2"><Stars value={meuParticipante.estrelas} />{meuNivelCongelado ? <span className="chip bg-ink/5 text-ink/45"><Lock size={10} /> Congelado</span> : <Trend fechamento={fechamentos[meuParticipante.id]} />}</div><p className="mt-2 text-xs leading-relaxed text-ink/40">Seu nível é recalculado uma vez por mês, com base no desempenho de todos os domingos que você jogou.</p></div></div></div> : <div className="panel overflow-hidden"><div className="border-b border-ink/8 bg-turf-50 p-5"><p className="text-lg font-extrabold">Crie seu perfil de jogador</p><p className="mt-1 text-sm text-ink/45">Preencha seus dados uma única vez para entrar no elenco.</p></div><form onSubmit={saveSelf} className="p-5 md:p-6"><label className="label">Nome completo</label><input autoFocus className="input" value={form.nome} onChange={(e) => setForm({ ...form, nome: e.target.value })} placeholder="Ex: Carlos Eduardo" required /><label className="label mt-4">Apelido</label><input className="input" value={form.apelido} onChange={(e) => setForm({ ...form, apelido: e.target.value })} placeholder="Ex: Cadu" required /><p className="mt-1 text-xs text-ink/40">É o nome mostrado no campo durante a partida ao vivo.</p><label className="label mt-4">Posição</label><select className="input" value={form.posicao} onChange={(e) => setForm({ ...form, posicao: e.target.value as Posicao })}>{Object.entries(positionLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><label className="label mt-4">Foto <span className="normal-case tracking-normal text-ink/30">(opcional)</span></label><label className="flex min-h-20 cursor-pointer items-center justify-center rounded-xl border border-dashed border-ink/20 bg-ink/[.02] px-4 text-center text-sm font-semibold text-ink/50 hover:bg-turf-50"><input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" onChange={(e) => setPhoto(e.target.files?.[0] ?? null)} />{photo ? photo.name : 'Escolher foto do celular'}</label><button disabled={saving} className="btn-primary mt-6 w-full"><Check size={17} /> {saving ? 'Salvando...' : 'Criar meu perfil'}</button></form></div>}
   </div>
+  }
+
+  // Organizador: lista vazia por erro nunca aparece como "pelada sem jogadores".
+  if (rosterStatus === 'loading') return loadingPanel('Carregando participantes...')
+  if (rosterStatus === 'error') return errorPanel('Não foi possível carregar a lista de participantes', onRetryRoster)
 
   return <div><div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div><p className="text-sm text-ink/45">Cadastre e mantenha o elenco da pelada atualizado.</p><div className="mt-3 flex flex-wrap gap-2"><span className="chip bg-turf-100 text-turf-700">{players.filter((p) => p.ativo).length} ativos</span><span className="chip bg-ink/5 text-ink/50">{players.filter((p) => !p.ativo).length} inativos</span><span className="chip bg-amber-100 text-amber-800" title="O nível de cada jogador é recalculado sozinho no fechamento do mês">Níveis automáticos</span>{nivelStatus === 'error' && <button onClick={retryNivel} className="chip bg-red-100 text-red-700" title="O estado congelado/automático não carregou; a edição fica bloqueada até carregar"><RefreshCw size={11} /> Estado de nível indisponível · tentar de novo</button>}</div></div><button onClick={openNew} className="btn-primary"><UserPlus size={18} /> Novo participante</button></div>
     <div className="panel mt-5 overflow-hidden"><div className="flex flex-col gap-3 border-b border-ink/8 p-4 sm:flex-row sm:items-center"><div className="relative max-w-md flex-1"><Search className="absolute left-3 top-3.5 text-ink/35" size={18} /><input className="input pl-10" placeholder="Buscar por nome..." value={search} onChange={(e) => setSearch(e.target.value)} /></div><span className="text-xs font-semibold text-ink/40">{visible.length} participantes</span></div><div className="divide-y divide-ink/7">{visible.map((p) => <div key={p.id} className={`flex items-center gap-3 p-4 transition ${!p.ativo ? 'opacity-45' : 'hover:bg-ink/[.02]'}`}><Avatar player={p} /><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{p.nome}</p><div className="mt-1 flex flex-wrap items-center gap-2"><span className="text-xs text-ink/45">{positionLabel[p.posicao]}</span><Stars value={p.estrelas} />{congelado(p) ? <span className="chip bg-ink/5 text-ink/45" title="Nível congelado: o fechamento mensal não mexe nele"><Lock size={10} /> Congelado</span> : <Trend fechamento={fechamentos[p.id]} />}</div></div><span className={`hidden sm:inline-flex chip ${p.ativo ? 'bg-turf-100 text-turf-700' : 'bg-ink/5 text-ink/45'}`}>{p.ativo ? 'Ativo' : 'Inativo'}</span><button onClick={() => openEdit(p)} className="btn-soft !min-h-9 !px-3" title="Editar"><Pencil size={15} /></button><button onClick={() => toggle(p)} className="btn-soft !min-h-9 !px-3" title={p.ativo ? 'Desativar' : 'Reativar'}>{p.ativo ? <Trash2 size={15} /> : <RotateCcw size={15} />}</button></div>)}</div></div>
@@ -675,14 +736,15 @@ function shuffleEqualStarGroups(players: Participante[]) {
   return shuffled
 }
 
-// Pares que o sorteio nunca deixa no mesmo time. Aceita o id do participante ou
-// o id do perfil vinculado a ele.
+// Pares que o sorteio nunca deixa no mesmo time, por id de PARTICIPANTE. Os três ids
+// abaixo foram conferidos no backup: todos são participantes da mesma pelada, nenhum é
+// perfil. O app não lê mais perfil_id da lista; um id de perfil aqui nunca casaria.
 const PARES_SEPARADOS: [string, string][] = [
   ['676a3acd-fb46-474d-a9be-d23fb6dcf811', '7b922a98-d68c-4f58-9f28-7989d7f8431e'],
   ['676a3acd-fb46-474d-a9be-d23fb6dcf811', '879ea831-e04f-4c11-ae14-c0d9b45cdaa2'],
 ]
 
-const mesmoJogador = (p: Participante, id: string) => p.id === id || p.perfil_id === id
+const mesmoJogador = (p: Participante, id: string) => p.id === id
 
 const contarConflitos = (teams: Time[]) => PARES_SEPARADOS.filter(([a, b]) => teams.some((t) => t.jogadores.some((p) => mesmoJogador(p, a)) && t.jogadores.some((p) => mesmoJogador(p, b)))).length
 
@@ -776,7 +838,7 @@ function Draw({ players, checkins, setCheckins, teams, setTeams, teamSize, setTe
   }
   const draw = () => { if (drawLocked) return toast.error('O sorteio desta sessão já foi confirmado.'); const result = serpentineDraw(pool, teamSize); if (result.length < 2) return toast.error(`Faltam ${teamSize * 2 - pool.length} jogadores para formar dois times.`); setTeams(result); setStatus('sorteando'); toast.success(`${result.length} times equilibrados!`) }
   const swap = (teamIndex: number, player: Participante) => { const next = (teamIndex + 1) % teams.length; setTeams((old) => old.map((t, i) => i === teamIndex ? { ...t, jogadores: t.jogadores.filter((p) => p.id !== player.id).concat(old[next].jogadores[0] ? [old[next].jogadores[0]] : []) } : i === next ? { ...t, jogadores: t.jogadores.slice(1).concat(player) } : t)); toast('Jogadores trocados') }
-  const confirm = async () => { if (supabase) { const { error } = await supabase.rpc('confirmar_sorteio', { p_sessao_id: sessionId, p_times: teams.map((t) => ({ numero: t.numero, jogadores: t.jogadores.map((p) => p.id) })) }); if (error) return toast.error(error.message); const loaded = await supabase.from('times').select('*, times_jogadores(participantes(*))').eq('sessao_id', sessionId).order('posicao_fila'); if (loaded.error) return toast.error(loaded.error.message); setTeams((loaded.data ?? []).map((t) => ({ ...t, jogadores: t.times_jogadores.map((j: { participantes: Participante }) => j.participantes) })) as Time[]) } setCheckins((old) => old.map((c) => teams.some((t) => t.jogadores.some((p) => p.id === c.participante_id)) ? { ...c, alocado: true } : c)); setStatus('em_andamento'); toast.success('Times confirmados. Bora jogar!'); goLive() }
+  const confirm = async () => { if (supabase) { const { error } = await supabase.rpc('confirmar_sorteio', { p_sessao_id: sessionId, p_times: teams.map((t) => ({ numero: t.numero, jogadores: t.jogadores.map((p) => p.id) })) }); if (error) return toast.error(error.message); const loaded = await supabase.from('times').select(`*, times_jogadores(participantes(${PARTICIPANTE_COLUNAS}))`).eq('sessao_id', sessionId).order('posicao_fila'); if (loaded.error) return toast.error(loaded.error.message); setTeams((loaded.data ?? []).map((t) => ({ ...t, jogadores: t.times_jogadores.map((j: { participantes: Participante }) => j.participantes) })) as Time[]) } setCheckins((old) => old.map((c) => teams.some((t) => t.jogadores.some((p) => p.id === c.participante_id)) ? { ...c, alocado: true } : c)); setStatus('em_andamento'); toast.success('Times confirmados. Bora jogar!'); goLive() }
   return <div><div className="panel flex flex-col justify-between gap-5 p-5 sm:flex-row sm:items-center"><div><p className="text-sm font-bold">Formato dos times</p><p className="mt-1 text-xs text-ink/45">Times de linha — o goleiro entra além do número mostrado, quando houver um disponível.</p></div><div>{drawLocked && <p className="mb-2 max-w-xs text-xs font-semibold leading-relaxed text-amber-700">Sorteio já confirmado para hoje — para mudar o formato, será preciso esperar a próxima sessão.</p>}<div className="flex rounded-xl bg-ink/5 p-1">{[5,6].map((n) => <button key={n} disabled={drawLocked} onClick={() => changeTeamSize(n)} className={`rounded-lg px-5 py-2 text-sm font-bold transition disabled:cursor-not-allowed disabled:opacity-45 ${teamSize === n ? 'bg-white shadow-sm' : 'text-ink/40'}`}>{n} × {n}</button>)}</div></div><div className="sm:text-right"><p className="text-2xl font-black">{possible}</p><p className="text-xs text-ink/45">times completos possíveis</p></div></div>
     {!teams.length ? <div className="panel mt-5 grid min-h-[420px] place-items-center overflow-hidden p-6 text-center"><div className="max-w-lg"><div className="mx-auto grid h-20 w-20 place-items-center rounded-[28px] bg-lime text-ink"><Sparkles size={35} /></div><h2 className="mt-6 text-2xl font-black">Equilibre o jogo em segundos</h2><p className="mt-3 text-sm leading-relaxed text-ink/50">Vamos priorizar goleiros, ordenar por nível e distribuir em serpentina. Só entram times completos; quem sobrar continua como reserva.</p><div className="mx-auto mt-6 flex max-w-sm items-center justify-center gap-5 rounded-2xl bg-ink/[.035] p-4"><div><b className="text-xl">{available.length}</b><p className="text-[11px] text-ink/40">disponíveis</p></div><div className="h-8 w-px bg-ink/10" /><div><b className="text-xl">{possible}</b><p className="text-[11px] text-ink/40">times</p></div><div className="h-8 w-px bg-ink/10" /><div><b className="text-xl">{reserves}</b><p className="text-[11px] text-ink/40">reservas</p></div></div><button onClick={draw} disabled={possible < 2 || drawLocked} className="btn-lime mt-7 min-w-48"><Sparkles size={18} /> Sortear agora</button>{possible < 2 && <p className="mt-3 text-xs font-semibold text-orange">São necessários pelo menos {teamSize * 2} presentes.</p>}</div></div> : <><div className="mt-5 flex items-center justify-between"><div><p className="font-extrabold">Prévia dos times</p><p className="text-xs text-ink/45">{drawLocked ? 'Times confirmados para a sessão de hoje.' : 'Toque nas setas para fazer um ajuste rápido.'}</p></div>{!drawLocked && <button onClick={draw} className="btn-soft"><RotateCcw size={16} /> Refazer</button>}</div><div className="mt-4 grid gap-4 lg:grid-cols-2 xl:grid-cols-3">{teams.map((team, ti) => <div key={team.id} className="panel overflow-hidden"><div className="flex items-center justify-between p-4 text-white" style={{ background: ti < 2 ? '#0D1B2A' : '#1B3A5C' }}><div className="flex items-center gap-2"><span className="grid h-9 w-9 place-items-center rounded-xl text-sm font-black text-ink" style={{ background: teamColors[ti % teamColors.length] }}>{team.numero}</span><div><p className="text-sm font-extrabold">Time {team.numero}</p><p className="text-[10px] text-white/45">{team.jogadores.reduce((n,p) => n + p.estrelas, 0)} estrelas no total</p></div></div><span className="chip bg-white/10 text-white/70">{ti < 2 ? 'Joga agora' : `${ti + 1}º na fila`}</span></div><div className="divide-y divide-ink/7">{team.jogadores.map((p) => <div key={p.id} className="flex items-center gap-3 p-3.5"><Avatar player={p} size="sm" ring={p.posicao === 'goleiro' ? teamColors[ti % teamColors.length] : undefined} /><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{p.nome}</p><div className="flex items-center gap-2"><span className="text-[10px] text-ink/40">{positionLabel[p.posicao]}</span><Stars value={p.estrelas} /></div></div>{!drawLocked && <button onClick={() => swap(ti, p)} className="rounded-lg p-2 text-ink/25 hover:bg-ink/5 hover:text-ink" title="Trocar com próximo time"><ArrowLeftRight size={16} /></button>}</div>)}</div></div>)}</div>{reservePlayers.length > 0 && <div className="panel mt-4 overflow-hidden"><div className="flex items-center justify-between p-4"><div><p className="text-sm font-extrabold">Reservas</p><p className="text-xs text-ink/45">Ficaram de fora dos times completos desta prévia.</p></div><span className="chip bg-ink/5 text-ink/50">{reservePlayers.length}</span></div><div className="divide-y divide-ink/7">{reservePlayers.map((p) => <div key={p.id} className="flex items-center gap-3 p-3.5"><Avatar player={p} size="sm" /><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{p.nome}</p><div className="flex items-center gap-2"><span className="text-[10px] text-ink/40">{positionLabel[p.posicao]}</span><Stars value={p.estrelas} /></div></div></div>)}</div></div>}{!drawLocked && <div className="sticky bottom-4 mt-6 flex justify-end"><button onClick={confirm} className="btn-lime shadow-xl"><Check size={18} /> Confirmar times e iniciar</button></div>}</>}
   </div>
@@ -825,7 +887,7 @@ function LiveMatch({ readOnly, teams, setTeams, players, match, setMatch, events
     if (supabase) {
       const { error } = await supabase.rpc('finalizar_partida_e_girar_fila', { p_partida_id: alvo.id, p_proximo_time_a_id: proximo?.[0] ?? null, p_proximo_time_b_id: proximo?.[1] ?? null })
       if (error) { setFinishing(false); toast.error(error.message); return }
-      const { data } = await supabase.from('times').select('*, times_jogadores(participantes(*))').eq('sessao_id', sessionId).order('posicao_fila')
+      const { data } = await supabase.from('times').select(`*, times_jogadores(participantes(${PARTICIPANTE_COLUNAS}))`).eq('sessao_id', sessionId).order('posicao_fila')
       if (data) setTeams(data.map((t) => ({ ...t, jogadores: t.times_jogadores.map((j: { participantes: Participante }) => j.participantes) })) as Time[])
     } else {
       setTeams(proximo ? computeManualDrawRotation(alvo, proximo[0], proximo[1]) : computeAutomaticRotation(alvo))
