@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noEmitOnError": true,
+    "types": [],
+    "lib": ["ES2022"],
+    "rootDir": "../.."
+  },
+  "files": ["../../src/contracts/public-read-v1.ts", "public-read-v1.types.ts"]
+}

@@ -9,6 +9,14 @@ import {
   Hourglass, Lock, Mail, RefreshCw, Shirt, Sparkles, Star, TimerReset, Trash2, TrendingDown, TrendingUp, Trophy, UserCheck, UserPlus, UserX, Users, X,
 } from 'lucide-react'
 import { CheckIn, Fechamento, GolEvento, hasSupabase, initials, Papel, Participante, positionLabel, Posicao, Racha, RachaMembro, supabase, Time } from './lib/supabase'
+import { loadMyParticipantV1, loadParticipantManagementV1 } from './data/participant-context-reader-v1'
+import type { ParticipantManagementV1 } from './contracts/participant-context-v1'
+
+// Colunas que a UI usa de fato. Substitui o select('*'), que trazia também as colunas
+// internas de cálculo do nível. perfil_id/estrelas_travadas seguem aqui só para a regra
+// de pares do sorteio e o cartão do próprio jogador comum (pendentes, fora desta unidade).
+const PARTICIPANTE_COLUNAS = 'id, perfil_id, nome, apelido, foto_url, estrelas, posicao, ativo, estrelas_travadas'
+type NivelEstado = ParticipantManagementV1['nivel_estado']
 
 type View = 'inicio' | 'participantes' | 'checkin' | 'sorteio' | 'partida' | 'historico' | 'aprovacoes'
 type SessionStatus = 'aguardando_checkin' | 'sorteando' | 'em_andamento' | 'finalizada'
@@ -213,7 +221,7 @@ function App() {
     if (!supabase || !authEmail || !papel || papel === 'pendente' || !rachaAtivoId) return
     const db = supabase
     const load = async () => {
-      const { data: participantData } = await db.from('participantes').select('*').eq('racha_id', rachaAtivoId).order('nome')
+      const { data: participantData } = await db.from('participantes').select(PARTICIPANTE_COLUNAS).eq('racha_id', rachaAtivoId).order('nome')
       if (participantData) setPlayers(participantData as Participante[])
       await loadFechamentos(rachaAtivoId)
       const sessionQuery = await db.from('sessoes').select('*').eq('racha_id', rachaAtivoId).neq('status', 'finalizada').order('criado_em', { ascending: false }).limit(1).maybeSingle()
@@ -484,11 +492,63 @@ function Participants({ players, setPlayers, papel, userId, rachaId, fechamentos
   const [editingId, setEditingId] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [saving, setSaving] = useState(false)
-  const meuParticipante = userId ? players.find((p) => p.perfil_id === userId) : undefined
+
+  // Vínculo próprio derivado no servidor (obter_meu_participante_v1), não por perfil_id no
+  // cliente. Erro nunca vira "sem vínculo": o autocadastro só abre com resposta confirmada.
+  const selfKey = supabase && papel === 'normal' && rachaId && userId ? `${rachaId}:${userId}` : null
+  const [selfRead, setSelfRead] = useState<{ key: string; participanteId?: string | null; failed?: boolean } | null>(null)
+  const [selfRetry, setSelfRetry] = useState(0)
+  useEffect(() => {
+    if (!supabase || !selfKey || !rachaId) return
+    const controller = new AbortController()
+    loadMyParticipantV1(supabase, { rachaId, signal: controller.signal })
+      .then((result) => setSelfRead({ key: selfKey, participanteId: result.participante_id }))
+      .catch(() => { if (!controller.signal.aborted) setSelfRead({ key: selfKey, failed: true }) })
+    return () => controller.abort()
+  }, [selfKey, rachaId, selfRetry])
+  const selfStatus = !supabase ? 'local' : !selfKey ? 'idle' : selfRead?.key !== selfKey ? 'loading' : selfRead.failed ? 'error' : 'ready'
+  const selfParticipanteId = selfStatus === 'ready' ? selfRead?.participanteId ?? null : null
+  const meuParticipante = selfStatus === 'local'
+    ? (userId ? players.find((p) => p.perfil_id === userId) : undefined)
+    : selfParticipanteId ? players.find((p) => p.id.toLowerCase() === selfParticipanteId) : undefined
+  const retrySelf = () => { setSelfRead(null); setSelfRetry((n) => n + 1) }
+
+  // Estado de nível (congelado/automático) só pelo contrato de gestão, autorizado no servidor
+  // a cada chamada. Lotes de até 100 IDs já presentes na lista; falha não vira "automático".
+  const playerIds = useMemo(() => players.map((p) => p.id).join(','), [players])
+  const nivelKey = supabase && papel === 'admin' && rachaId ? `${rachaId}:${playerIds}` : null
+  const [nivelRead, setNivelRead] = useState<{ key: string; niveis?: Record<string, NivelEstado>; failed?: boolean } | null>(null)
+  const [nivelRetry, setNivelRetry] = useState(0)
+  useEffect(() => {
+    if (!supabase || !nivelKey || !rachaId) return
+    const ids = playerIds ? playerIds.split(',') : []
+    // A lista começa com os jogadores de demonstração até a carga real chegar.
+    if (ids.some((id) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id))) return
+    const db = supabase
+    const controller = new AbortController()
+    const run = async () => {
+      const niveis: Record<string, NivelEstado> = {}
+      for (let i = 0; i < ids.length; i += 100) {
+        const lote = await loadParticipantManagementV1(db, { rachaId, participantIds: ids.slice(i, i + 100), signal: controller.signal })
+        for (const item of lote) niveis[item.participante_id] = item.nivel_estado
+      }
+      return niveis
+    }
+    run().then((niveis) => setNivelRead({ key: nivelKey, niveis }))
+      .catch(() => { if (!controller.signal.aborted) setNivelRead({ key: nivelKey, failed: true }) })
+    return () => controller.abort()
+  }, [nivelKey, rachaId, playerIds, nivelRetry])
+  const nivelStatus = !supabase ? 'local' : !nivelKey ? 'idle' : nivelRead?.key !== nivelKey ? 'loading' : nivelRead.failed ? 'error' : 'ready'
+  const congelado = (p: Participante) => nivelStatus === 'local' ? Boolean(p.estrelas_travadas) : nivelRead?.niveis?.[p.id.toLowerCase()] === 'congelado'
+  const retryNivel = () => { setNivelRead(null); setNivelRetry((n) => n + 1) }
 
   const closeModal = () => { setOpen(false); setEditingId(null); setForm(blank); setPhoto(null) }
   const openNew = () => { setForm(blank); setPhoto(null); setEditingId(null); setOpen(true) }
-  const openEdit = (p: Participante) => { setForm({ nome: p.nome, apelido: p.apelido ?? '', estrelas: p.estrelas, posicao: p.posicao, foto_url: p.foto_url ?? '', estrelas_travadas: p.estrelas_travadas ?? false }); setPhoto(null); setEditingId(p.id); setOpen(true) }
+  const openEdit = (p: Participante) => {
+    // Sem o estado confirmado, salvar poderia sobrescrever o congelamento com "falso".
+    if (nivelStatus !== 'local' && nivelStatus !== 'ready') { toast.error(nivelStatus === 'error' ? 'Não foi possível carregar o estado de nível. Tente novamente.' : 'Carregando o estado de nível...'); return }
+    setForm({ nome: p.nome, apelido: p.apelido ?? '', estrelas: p.estrelas, posicao: p.posicao, foto_url: p.foto_url ?? '', estrelas_travadas: congelado(p) }); setPhoto(null); setEditingId(p.id); setOpen(true)
+  }
 
   const resolvePhotoUrl = async () => {
     let photoUrl = form.foto_url || null
@@ -513,6 +573,8 @@ function Participants({ players, setPlayers, papel, userId, rachaId, fechamentos
           const { data, error } = await supabase.from('participantes').update(patch).eq('id', editingId).select().single()
           if (error) throw new Error(error.message)
           setPlayers((old) => old.map((x) => x.id === editingId ? (data as Participante) : x))
+          const salvo: NivelEstado = form.estrelas_travadas ? 'congelado' : 'automatico'
+          setNivelRead((r) => r?.niveis ? { ...r, niveis: { ...r.niveis, [editingId.toLowerCase()]: salvo } } : r)
         } else setPlayers((old) => old.map((x) => x.id === editingId ? { ...x, ...patch } : x))
         toast.success('Participante atualizado!')
       } else {
@@ -535,6 +597,7 @@ function Participants({ players, setPlayers, papel, userId, rachaId, fechamentos
     e.preventDefault()
     if (meuParticipante) return
     if (!userId) return toast.error('Não foi possível identificar o usuário autenticado.')
+    if (selfStatus !== 'local' && !(selfStatus === 'ready' && selfParticipanteId === null)) return toast.error('Não foi possível confirmar seu vínculo agora. Tente novamente.')
     const nome = form.nome.trim()
     if (!nome) return
     setSaving(true)
@@ -545,7 +608,9 @@ function Participants({ players, setPlayers, papel, userId, rachaId, fechamentos
         if (!rachaId) throw new Error('Racha não identificado.')
         const { data, error } = await supabase.from('participantes').insert({ racha_id: rachaId, nome: player.nome, apelido: player.apelido, posicao: player.posicao, foto_url: player.foto_url, estrelas: 3, perfil_id: userId }).select().single()
         if (error) throw new Error(error.message)
-        setPlayers((old) => old.some((p) => p.perfil_id === userId) ? old : [...old, data as Participante])
+        const criado = data as Participante
+        setPlayers((old) => old.some((p) => p.id === criado.id) ? old : [...old, criado])
+        if (selfKey) setSelfRead({ key: selfKey, participanteId: criado.id.toLowerCase() })
       } else setPlayers((old) => old.some((p) => p.perfil_id === userId) ? old : [...old, player])
       setForm(blank); setPhoto(null); toast.success('Seu perfil de jogador foi criado!')
     } catch (error) {
@@ -559,11 +624,13 @@ function Participants({ players, setPlayers, papel, userId, rachaId, fechamentos
   const visible = players.filter((p) => p.nome.toLowerCase().includes(search.toLowerCase()))
 
   if (papel === 'normal') return <div className="mx-auto max-w-2xl">
-    {meuParticipante ? <div className="panel overflow-hidden"><div className="border-b border-ink/8 bg-turf-50 p-5"><p className="text-lg font-extrabold">Seu perfil de jogador</p><p className="mt-1 text-sm text-ink/45">Este é o perfil vinculado à sua conta.</p></div><div className="flex items-center gap-5 p-6"><Avatar player={meuParticipante} size="lg" ring="#1FB8AE" /><div className="min-w-0"><p className="truncate text-xl font-black">{meuParticipante.nome}</p><p className="mt-1 text-sm font-semibold text-ink/50">{positionLabel[meuParticipante.posicao]}</p><div className="mt-2 flex flex-wrap items-center gap-2"><Stars value={meuParticipante.estrelas} />{meuParticipante.estrelas_travadas ? <span className="chip bg-ink/5 text-ink/45"><Lock size={10} /> Congelado</span> : <Trend fechamento={fechamentos[meuParticipante.id]} />}</div><p className="mt-2 text-xs leading-relaxed text-ink/40">Seu nível é recalculado uma vez por mês, com base no desempenho de todos os domingos que você jogou.</p></div></div></div> : <div className="panel overflow-hidden"><div className="border-b border-ink/8 bg-turf-50 p-5"><p className="text-lg font-extrabold">Crie seu perfil de jogador</p><p className="mt-1 text-sm text-ink/45">Preencha seus dados uma única vez para entrar no elenco.</p></div><form onSubmit={saveSelf} className="p-5 md:p-6"><label className="label">Nome completo</label><input autoFocus className="input" value={form.nome} onChange={(e) => setForm({ ...form, nome: e.target.value })} placeholder="Ex: Carlos Eduardo" required /><label className="label mt-4">Apelido</label><input className="input" value={form.apelido} onChange={(e) => setForm({ ...form, apelido: e.target.value })} placeholder="Ex: Cadu" required /><p className="mt-1 text-xs text-ink/40">É o nome mostrado no campo durante a partida ao vivo.</p><label className="label mt-4">Posição</label><select className="input" value={form.posicao} onChange={(e) => setForm({ ...form, posicao: e.target.value as Posicao })}>{Object.entries(positionLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><label className="label mt-4">Foto <span className="normal-case tracking-normal text-ink/30">(opcional)</span></label><label className="flex min-h-20 cursor-pointer items-center justify-center rounded-xl border border-dashed border-ink/20 bg-ink/[.02] px-4 text-center text-sm font-semibold text-ink/50 hover:bg-turf-50"><input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" onChange={(e) => setPhoto(e.target.files?.[0] ?? null)} />{photo ? photo.name : 'Escolher foto do celular'}</label><button disabled={saving} className="btn-primary mt-6 w-full"><Check size={17} /> {saving ? 'Salvando...' : 'Criar meu perfil'}</button></form></div>}
+    {selfStatus === 'loading' || (selfParticipanteId && !meuParticipante) ? <div className="panel grid min-h-40 place-items-center p-8 text-center text-sm font-semibold text-ink/45">Carregando seu perfil de jogador...</div>
+    : selfStatus === 'error' ? <div className="panel p-6 text-center"><p className="font-bold">Não foi possível confirmar seu perfil agora</p><p className="mt-1 text-sm text-ink/45">Verifique sua conexão e tente novamente.</p><button onClick={retrySelf} className="btn-soft mt-4"><RefreshCw size={16} /> Tentar de novo</button></div>
+    : meuParticipante ? <div className="panel overflow-hidden"><div className="border-b border-ink/8 bg-turf-50 p-5"><p className="text-lg font-extrabold">Seu perfil de jogador</p><p className="mt-1 text-sm text-ink/45">Este é o perfil vinculado à sua conta.</p></div><div className="flex items-center gap-5 p-6"><Avatar player={meuParticipante} size="lg" ring="#1FB8AE" /><div className="min-w-0"><p className="truncate text-xl font-black">{meuParticipante.nome}</p><p className="mt-1 text-sm font-semibold text-ink/50">{positionLabel[meuParticipante.posicao]}</p><div className="mt-2 flex flex-wrap items-center gap-2"><Stars value={meuParticipante.estrelas} />{meuParticipante.estrelas_travadas ? <span className="chip bg-ink/5 text-ink/45"><Lock size={10} /> Congelado</span> : <Trend fechamento={fechamentos[meuParticipante.id]} />}</div><p className="mt-2 text-xs leading-relaxed text-ink/40">Seu nível é recalculado uma vez por mês, com base no desempenho de todos os domingos que você jogou.</p></div></div></div> : <div className="panel overflow-hidden"><div className="border-b border-ink/8 bg-turf-50 p-5"><p className="text-lg font-extrabold">Crie seu perfil de jogador</p><p className="mt-1 text-sm text-ink/45">Preencha seus dados uma única vez para entrar no elenco.</p></div><form onSubmit={saveSelf} className="p-5 md:p-6"><label className="label">Nome completo</label><input autoFocus className="input" value={form.nome} onChange={(e) => setForm({ ...form, nome: e.target.value })} placeholder="Ex: Carlos Eduardo" required /><label className="label mt-4">Apelido</label><input className="input" value={form.apelido} onChange={(e) => setForm({ ...form, apelido: e.target.value })} placeholder="Ex: Cadu" required /><p className="mt-1 text-xs text-ink/40">É o nome mostrado no campo durante a partida ao vivo.</p><label className="label mt-4">Posição</label><select className="input" value={form.posicao} onChange={(e) => setForm({ ...form, posicao: e.target.value as Posicao })}>{Object.entries(positionLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><label className="label mt-4">Foto <span className="normal-case tracking-normal text-ink/30">(opcional)</span></label><label className="flex min-h-20 cursor-pointer items-center justify-center rounded-xl border border-dashed border-ink/20 bg-ink/[.02] px-4 text-center text-sm font-semibold text-ink/50 hover:bg-turf-50"><input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" onChange={(e) => setPhoto(e.target.files?.[0] ?? null)} />{photo ? photo.name : 'Escolher foto do celular'}</label><button disabled={saving} className="btn-primary mt-6 w-full"><Check size={17} /> {saving ? 'Salvando...' : 'Criar meu perfil'}</button></form></div>}
   </div>
 
-  return <div><div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div><p className="text-sm text-ink/45">Cadastre e mantenha o elenco da pelada atualizado.</p><div className="mt-3 flex flex-wrap gap-2"><span className="chip bg-turf-100 text-turf-700">{players.filter((p) => p.ativo).length} ativos</span><span className="chip bg-ink/5 text-ink/50">{players.filter((p) => !p.ativo).length} inativos</span><span className="chip bg-amber-100 text-amber-800" title="O nível de cada jogador é recalculado sozinho no fechamento do mês">Níveis automáticos</span></div></div><button onClick={openNew} className="btn-primary"><UserPlus size={18} /> Novo participante</button></div>
-    <div className="panel mt-5 overflow-hidden"><div className="flex flex-col gap-3 border-b border-ink/8 p-4 sm:flex-row sm:items-center"><div className="relative max-w-md flex-1"><Search className="absolute left-3 top-3.5 text-ink/35" size={18} /><input className="input pl-10" placeholder="Buscar por nome..." value={search} onChange={(e) => setSearch(e.target.value)} /></div><span className="text-xs font-semibold text-ink/40">{visible.length} participantes</span></div><div className="divide-y divide-ink/7">{visible.map((p) => <div key={p.id} className={`flex items-center gap-3 p-4 transition ${!p.ativo ? 'opacity-45' : 'hover:bg-ink/[.02]'}`}><Avatar player={p} /><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{p.nome}</p><div className="mt-1 flex flex-wrap items-center gap-2"><span className="text-xs text-ink/45">{positionLabel[p.posicao]}</span><Stars value={p.estrelas} />{p.estrelas_travadas ? <span className="chip bg-ink/5 text-ink/45" title="Nível congelado: o fechamento mensal não mexe nele"><Lock size={10} /> Congelado</span> : <Trend fechamento={fechamentos[p.id]} />}</div></div><span className={`hidden sm:inline-flex chip ${p.ativo ? 'bg-turf-100 text-turf-700' : 'bg-ink/5 text-ink/45'}`}>{p.ativo ? 'Ativo' : 'Inativo'}</span><button onClick={() => openEdit(p)} className="btn-soft !min-h-9 !px-3" title="Editar"><Pencil size={15} /></button><button onClick={() => toggle(p)} className="btn-soft !min-h-9 !px-3" title={p.ativo ? 'Desativar' : 'Reativar'}>{p.ativo ? <Trash2 size={15} /> : <RotateCcw size={15} />}</button></div>)}</div></div>
+  return <div><div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div><p className="text-sm text-ink/45">Cadastre e mantenha o elenco da pelada atualizado.</p><div className="mt-3 flex flex-wrap gap-2"><span className="chip bg-turf-100 text-turf-700">{players.filter((p) => p.ativo).length} ativos</span><span className="chip bg-ink/5 text-ink/50">{players.filter((p) => !p.ativo).length} inativos</span><span className="chip bg-amber-100 text-amber-800" title="O nível de cada jogador é recalculado sozinho no fechamento do mês">Níveis automáticos</span>{nivelStatus === 'error' && <button onClick={retryNivel} className="chip bg-red-100 text-red-700" title="O estado congelado/automático não carregou; a edição fica bloqueada até carregar"><RefreshCw size={11} /> Estado de nível indisponível · tentar de novo</button>}</div></div><button onClick={openNew} className="btn-primary"><UserPlus size={18} /> Novo participante</button></div>
+    <div className="panel mt-5 overflow-hidden"><div className="flex flex-col gap-3 border-b border-ink/8 p-4 sm:flex-row sm:items-center"><div className="relative max-w-md flex-1"><Search className="absolute left-3 top-3.5 text-ink/35" size={18} /><input className="input pl-10" placeholder="Buscar por nome..." value={search} onChange={(e) => setSearch(e.target.value)} /></div><span className="text-xs font-semibold text-ink/40">{visible.length} participantes</span></div><div className="divide-y divide-ink/7">{visible.map((p) => <div key={p.id} className={`flex items-center gap-3 p-4 transition ${!p.ativo ? 'opacity-45' : 'hover:bg-ink/[.02]'}`}><Avatar player={p} /><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{p.nome}</p><div className="mt-1 flex flex-wrap items-center gap-2"><span className="text-xs text-ink/45">{positionLabel[p.posicao]}</span><Stars value={p.estrelas} />{congelado(p) ? <span className="chip bg-ink/5 text-ink/45" title="Nível congelado: o fechamento mensal não mexe nele"><Lock size={10} /> Congelado</span> : <Trend fechamento={fechamentos[p.id]} />}</div></div><span className={`hidden sm:inline-flex chip ${p.ativo ? 'bg-turf-100 text-turf-700' : 'bg-ink/5 text-ink/45'}`}>{p.ativo ? 'Ativo' : 'Inativo'}</span><button onClick={() => openEdit(p)} className="btn-soft !min-h-9 !px-3" title="Editar"><Pencil size={15} /></button><button onClick={() => toggle(p)} className="btn-soft !min-h-9 !px-3" title={p.ativo ? 'Desativar' : 'Reativar'}>{p.ativo ? <Trash2 size={15} /> : <RotateCcw size={15} />}</button></div>)}</div></div>
     {open && <Modal title={editingId ? 'Editar participante' : 'Novo participante'} onClose={closeModal}><form onSubmit={saveAdmin}><label className="label">Nome completo</label><input autoFocus className="input" value={form.nome} onChange={(e) => setForm({ ...form, nome: e.target.value })} placeholder="Ex: Carlos Eduardo" required /><label className="label mt-4">Apelido <span className="normal-case tracking-normal text-ink/30">(opcional)</span></label><input className="input" value={form.apelido} onChange={(e) => setForm({ ...form, apelido: e.target.value })} placeholder="Ex: Cadu" /><div className="mt-4 grid grid-cols-2 gap-3"><div><label className="label">Posição</label><select className="input" value={form.posicao} onChange={(e) => setForm({ ...form, posicao: e.target.value as Posicao })}>{Object.entries(positionLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></div><div><label className="label">Nível inicial</label><select className="input" value={form.estrelas} onChange={(e) => setForm({ ...form, estrelas: Number(e.target.value) })}>{[1,2,3,4,5].map((n) => <option key={n} value={n}>{'★'.repeat(n)} ({n})</option>)}</select></div></div><p className="mt-2 text-xs leading-relaxed text-ink/45">{editingId ? 'Mudar o nível aqui reposiciona o jogador no meio da nova faixa e descarta o histórico de pontuação dele.' : 'É só o ponto de partida. A partir do primeiro fechamento mensal, o nível sobe ou desce sozinho conforme o desempenho.'}</p><label className="mt-4 flex cursor-pointer items-start gap-3 rounded-xl border border-ink/10 bg-ink/[.02] p-3.5"><input type="checkbox" className="mt-0.5 h-4 w-4 accent-turf-500" checked={form.estrelas_travadas} onChange={(e) => setForm({ ...form, estrelas_travadas: e.target.checked })} /><span><span className="block text-sm font-bold">Congelar o nível deste jogador</span><span className="mt-0.5 block text-xs leading-relaxed text-ink/45">O desempenho continua sendo registrado, mas o fechamento mensal não mexe no nível. Útil para quem está voltando de lesão.</span></span></label><label className="label mt-4">Foto <span className="normal-case tracking-normal text-ink/30">(opcional)</span></label><label className="flex min-h-20 cursor-pointer items-center justify-center rounded-xl border border-dashed border-ink/20 bg-ink/[.02] px-4 text-center text-sm font-semibold text-ink/50 hover:bg-turf-50"><input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" onChange={(e) => setPhoto(e.target.files?.[0] ?? null)} />{photo ? photo.name : 'Escolher foto do celular'}</label><div className="mt-6 flex justify-end gap-2"><button type="button" className="btn-soft" onClick={closeModal}>Cancelar</button><button className="btn-primary"><Check size={17} /> {editingId ? 'Salvar alterações' : 'Salvar'}</button></div></form></Modal>}
   </div>
 }
