@@ -16,6 +16,8 @@ SQL = DRAFT.read_text()
 READER = 'atos_participant_context_reader'
 SELF = 'obter_meu_participante_v1'
 MANAGEMENT = 'obter_gestao_participantes_v1'
+PRIVATE = 'atos_participant_context'
+IDENTITY = (PRIVATE, 'request_user_id')
 
 
 def walk(value, key):
@@ -179,24 +181,34 @@ class ParticipantContextSQLTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.nodes = statements(SQL)
-        cls.functions = {strings(f['funcname'])[-1]: f for f in walk(cls.nodes, 'CreateFunctionStmt')}
+        created = {tuple(strings(f['funcname'])): f for f in walk(cls.nodes, 'CreateFunctionStmt')}
+        cls.all_functions = created
+        # The two public RPCs; the private identity helper is checked separately.
+        cls.functions = {name: f for (schema, name), f in created.items() if schema == 'public'}
+        cls.helper = created.get(IDENTITY)
 
     def test_pg17_sql_and_all_four_plpgsql_units_parse_offline(self):
         self.assertEqual(get_postgresql_version()[0], 17)
-        self.assertEqual(len(json.loads(parse_plpgsql_json(SQL))), 4)
+        # 2 DO blocks + 2 PL/pgSQL RPCs; libpg_query also returns the SQL-language helper.
+        self.assertEqual(len(json.loads(parse_plpgsql_json(SQL))), 5)
         self.assertFalse(DRAFT.is_relative_to(ROOT / 'supabase/migrations'))
         self.assertEqual(self.nodes[0]['TransactionStmt']['kind'], 'TRANS_STMT_BEGIN')
         self.assertEqual(self.nodes[-1]['TransactionStmt']['kind'], 'TRANS_STMT_COMMIT')
 
     def test_ddl_is_additive_and_does_not_touch_legacy_functions_or_data(self):
         allowed = {'TransactionStmt', 'VariableSetStmt', 'DoStmt', 'CreateRoleStmt', 'GrantRoleStmt',
-                   'GrantStmt', 'CreatePolicyStmt', 'CreateFunctionStmt', 'AlterOwnerStmt'}
+                   'GrantStmt', 'CreatePolicyStmt', 'CreateFunctionStmt', 'AlterOwnerStmt',
+                   'CreateSchemaStmt'}
         self.assertTrue(all(set(node) <= allowed for node in self.nodes))
         # ALTER DEFAULT PRIVILEGES FOR ROLE needs has_privs_of_role (INHERIT) in PG16+ and
         # would only affect objects the executor creates; it creates none.
         self.assertFalse(list(walk(self.nodes, 'AlterDefaultPrivilegesStmt')))
-        self.assertEqual(set(self.functions), {SELF, MANAGEMENT})
-        for function in self.functions.values():
+        self.assertEqual(set(self.all_functions), {('public', SELF), ('public', MANAGEMENT), IDENTITY})
+        schemas = list(walk(self.nodes, 'CreateSchemaStmt'))
+        self.assertEqual([s['schemaname'] for s in schemas], [PRIVATE])
+        self.assertFalse(schemas[0].get('if_not_exists', False))
+        self.assertNotIn('authrole', schemas[0])  # owned by the deployer, not the executor
+        for function in self.all_functions.values():
             self.assertFalse(function.get('replace', False))
         owners = list(walk(self.nodes, 'AlterOwnerStmt'))
         self.assertEqual(len(owners), 2)
@@ -235,7 +247,8 @@ class ParticipantContextSQLTests(unittest.TestCase):
     def test_authorization_precedes_payload_and_empty_batch_return_and_fails_on_null(self):
         for function in self.functions.values():
             _, body, _ = pl_body(function)
-            self.assertEqual(body[0]['PLpgSQL_stmt_assign']['expr']['PLpgSQL_expr']['query'].strip(), 'v_uid := auth.uid()')
+            self.assertEqual(body[0]['PLpgSQL_stmt_assign']['expr']['PLpgSQL_expr']['query'].strip(),
+                             'v_uid := atos_participant_context.request_user_id()')
             first_if = body[1]['PLpgSQL_stmt_if']
             self.assertEqual(first_if['cond']['PLpgSQL_expr']['query'], 'v_uid is null or p_racha_id is null')
             self.assertIn('PLpgSQL_stmt_raise', first_if['then_body'][0])
@@ -309,7 +322,7 @@ class ParticipantContextSQLTests(unittest.TestCase):
                                 r'\b(pontuacao|memoria|delta|config_estrelas|to_jsonb|row_to_json)\b|\w+\.\*')
 
     def test_function_bodies_only_read_and_call_allowlisted_functions(self):
-        allowed_calls = {('auth', 'uid')} | {('pg_catalog', name) for name in
+        allowed_calls = {IDENTITY} | {('pg_catalog', name) for name in
             ['count', 'bool_and', 'array_agg', 'jsonb_build_object', 'cardinality', 'array_ndims',
              'array_lower', 'array_position', 'unnest', 'min', 'jsonb_agg']}
         allowed_pl = {'PLpgSQL_stmt_block', 'PLpgSQL_stmt_assign', 'PLpgSQL_stmt_if',
@@ -438,18 +451,14 @@ class ParticipantContextSQLTests(unittest.TestCase):
                      "pg_has_role(current_user, c.relowner, 'USAGE')",
                      "has_schema_privilege(current_user, 'public', 'CREATE WITH GRANT OPTION')",
                      'PARTICIPANT_CONTEXT_REQUIRES_OBJECT_OWNER',
-                     "to_regprocedure('auth.uid()') is null", "p.prorettype = 'uuid'::pg_catalog.regtype",
-                     "has_schema_privilege(current_user, 'auth', 'USAGE WITH GRANT OPTION')",
-                     "'EXECUTE WITH GRANT OPTION'", 'PARTICIPANT_CONTEXT_AUTH_GRANT_UNAVAILABLE',
-                     "to_regrole('atos_participant_context_reader') is not null"]:
+                     "has_database_privilege(current_user, pg_catalog.current_database(), 'CREATE')",
+                     'PARTICIPANT_CONTEXT_REQUIRES_SCHEMA_CREATE',
+                     "to_regrole('atos_participant_context_reader') is not null",
+                     "to_regnamespace('atos_participant_context') is not null"]:
             self.assertIn(part, preflight)
-        # Existence is checked in its own IF before privilege functions that would error.
-        units = json.loads(parse_plpgsql_json(SQL))
-        conds = [n['cond']['PLpgSQL_expr']['query'] for n in walk(units[0], 'PLpgSQL_stmt_if')]
-        exists_at = next(i for i, c in enumerate(conds) if "to_regnamespace('auth') is null" in c)
-        privs_at = next(i for i, c in enumerate(conds) if "'auth', 'USAGE WITH GRANT OPTION'" in c)
-        self.assertLess(exists_at, privs_at)
-        self.assertNotIn('USAGE WITH GRANT OPTION', conds[exists_at])
+        # Supabase confirmed: postgres has no grant option on auth. Nothing may require it.
+        self.assertNotIn('AUTH_GRANT_UNAVAILABLE', SQL)
+        self.assertNotRegex(preflight, r"'auth'|auth\.uid")
 
     def test_only_executor_gets_column_grants_and_policy_changes(self):
         table_grants = [g for g in walk(self.nodes, 'GrantStmt') if g['objtype'] == 'OBJECT_TABLE']
@@ -492,7 +501,7 @@ class ParticipantContextSQLTests(unittest.TestCase):
         policies = list(walk(self.nodes, 'CreatePolicyStmt'))
         for policy in policies:
             for call in walk(policy['qual'], 'FuncCall'):
-                self.assertEqual(strings(call['funcname']), ['auth', 'uid'])
+                self.assertEqual(tuple(strings(call['funcname'])), IDENTITY)
         participant = next(p for p in policies if p['table']['relname'] == 'participantes')
         query = next(walk(participant['qual'], 'SubLink'))['subselect']['SelectStmt']
         predicate = query['whereClause']['BoolExpr']
@@ -501,7 +510,7 @@ class ParticipantContextSQLTests(unittest.TestCase):
         self.assertEqual(column(tenant['A_Expr']['lexpr']), ['m', 'racha_id'])
         self.assertEqual(column(tenant['A_Expr']['rexpr']), ['participantes', 'racha_id'])
         self.assertEqual(column(actor['A_Expr']['lexpr']), ['m', 'perfil_id'])
-        self.assertEqual(strings(actor['A_Expr']['rexpr']['FuncCall']['funcname']), ['auth', 'uid'])
+        self.assertEqual(tuple(strings(actor['A_Expr']['rexpr']['FuncCall']['funcname'])), IDENTITY)
         self.assertEqual(role['BoolExpr']['boolop'], 'OR_EXPR')
         admin, normal_self = role['BoolExpr']['args']
         self.assertEqual(admin['A_Expr']['rexpr']['TypeCast']['arg']['A_Const']['sval']['sval'], 'admin')
@@ -541,6 +550,92 @@ class ParticipantContextSQLTests(unittest.TestCase):
             changed['whereClause']['BoolExpr']['args'][0]['A_Expr']['rexpr']['ColumnRef']['fields'][0]['String']['sval'] = 'v_uid'
             with self.assertRaises(AssertionError):
                 assert_membership(self, changed, name == MANAGEMENT)
+
+    def test_identity_helper_reads_only_postgrest_claims_as_invoker(self):
+        # Supabase KB option 2: same claim source and expression as auth.uid(), no definer.
+        helper = self.helper
+        self.assertIsNotNone(helper)
+        opts = options(helper)
+        self.assertEqual(opts['language']['String']['sval'], 'sql')
+        self.assertEqual(opts['volatility']['String']['sval'], 'stable')
+        self.assertFalse(opts['security']['Boolean'].get('boolval', False))
+        self.assertEqual(strings(helper['returnType']['names']), ['uuid'])
+        self.assertFalse(helper['returnType'].get('setof', False))
+        self.assertFalse(helper.get('parameters'))
+        settings = {v['name']: [a['A_Const']['sval']['sval'] for a in v['args']]
+                    for v in walk(helper, 'VariableSetStmt')}
+        self.assertEqual(settings, {'search_path': ['']})
+        body = statements(opts['as']['List']['items'][0]['String']['sval'])
+        self.assertEqual([set(s) for s in body], [{'SelectStmt'}])
+        self.assertFalse(list(walk(body, 'RangeVar')))  # reads no table, auth or otherwise
+        calls = [(tuple(strings(c['funcname'])), [a['A_Const'] for a in c['args']])
+                 for c in walk(body, 'FuncCall')]
+        self.assertEqual([(name, [a.get('sval', {}).get('sval', a.get('boolval', {}).get('boolval'))
+                                  for a in args]) for name, args in calls],
+                         [(('pg_catalog', 'current_setting'), ['request.jwt.claim.sub', True]),
+                          (('pg_catalog', 'current_setting'), ['request.jwt.claims', True])])
+        target = body[0]['SelectStmt']['targetList'][0]['ResTarget']['val']['TypeCast']
+        self.assertEqual(strings(target['typeName']['names']), ['uuid'])
+        coalesce = target['arg']['CoalesceExpr']['args']
+        self.assertEqual(len(coalesce), 2)
+        self.assertEqual(coalesce[0]['A_Expr']['kind'], 'AEXPR_NULLIF')
+        claim = coalesce[1]['A_Expr']
+        self.assertEqual((strings(claim['name']), claim['rexpr']['A_Const']['sval']['sval']), (['->>'], 'sub'))
+        self.assertEqual(claim['lexpr']['TypeCast']['arg']['A_Expr']['kind'], 'AEXPR_NULLIF')
+
+    def test_identity_helper_and_private_schema_are_reachable_only_by_executor(self):
+        api_roles = {'PUBLIC', 'anon', 'authenticated', 'service_role'}
+
+        def grants_on(objtype, match):
+            return [(i, n['GrantStmt']) for i, n in enumerate(self.nodes)
+                    if 'GrantStmt' in n and n['GrantStmt']['objtype'] == objtype and match(n['GrantStmt'])]
+
+        def grantees(stmt):
+            return {r['RoleSpec'].get('rolename', 'PUBLIC') for r in stmt['grantees']}
+
+        schema_acl = grants_on('OBJECT_SCHEMA', lambda g: PRIVATE in strings(g['objects']))
+        self.assertEqual(len(schema_acl), 2)
+        (revoke_at, revoke), (grant_at, grant) = schema_acl
+        self.assertFalse(revoke.get('is_grant', False))
+        self.assertNotIn('privileges', revoke)
+        self.assertEqual(grantees(revoke), api_roles)
+        self.assertTrue(grant['is_grant'])
+        self.assertEqual(grant['privileges'], [{'AccessPriv': {'priv_name': 'usage'}}])
+        self.assertEqual(grantees(grant), {READER})
+        self.assertLess(revoke_at, grant_at)
+        function_acl = grants_on('OBJECT_FUNCTION', lambda g: tuple(
+            strings(g['objects'][0]['ObjectWithArgs']['objname'])) == IDENTITY)
+        self.assertEqual(len(function_acl), 2)
+        (revoke_at, revoke), (grant_at, grant) = function_acl
+        self.assertFalse(revoke.get('is_grant', False))
+        self.assertNotIn('privileges', revoke)
+        self.assertEqual(grantees(revoke), api_roles)
+        self.assertEqual(grant['privileges'], [{'AccessPriv': {'priv_name': 'execute'}}])
+        self.assertEqual(grantees(grant), {READER})
+        self.assertLess(revoke_at, grant_at)
+        self.assertNotIn('grant_option', grant)
+        guard = SQL.split('$acl_guard$')[1]
+        for part in ['PARTICIPANT_CONTEXT_UNEXPECTED_IDENTITY_ACL', 'n.nspowner <> v_creator',
+                     'p.proowner = v_creator and not p.prosecdef', ') <> 1 or exists',
+                     "acl.grantee = v_reader and acl.privilege_type = 'USAGE' and not acl.is_grantable",
+                     "acl.grantee = v_reader and acl.privilege_type = 'EXECUTE' and not acl.is_grantable",
+                     "has_schema_privilege(v_reader, 'atos_participant_context', 'CREATE')"]:
+            self.assertIn(part, guard)
+        for role in ['anon', 'authenticated', 'service_role']:
+            self.assertIn(f"has_schema_privilege('{role}', 'atos_participant_context', 'USAGE')", guard)
+            self.assertIn(f"has_function_privilege('{role}', 'atos_participant_context.request_user_id()', 'EXECUTE')", guard)
+
+    def test_no_auth_schema_grant_call_or_dependency(self):
+        # Hosted Supabase: postgres cannot pass auth privileges on; the draft must not try.
+        code = re.sub(r'--[^\n]*', '', SQL)
+        self.assertNotRegex(code, r'\bauth\.')
+        for stmt in walk(self.nodes, 'GrantStmt'):
+            self.assertNotIn('auth', strings([o for o in stmt['objects'] if 'String' in o]))
+            for obj in stmt['objects']:
+                if 'ObjectWithArgs' in obj:
+                    self.assertNotEqual(strings(obj['ObjectWithArgs']['objname'])[0], 'auth')
+        guard = SQL.split('$acl_guard$')[1]
+        self.assertIn("has_schema_privilege(v_reader, 'auth', 'USAGE')", guard)
 
 
 if __name__ == '__main__':

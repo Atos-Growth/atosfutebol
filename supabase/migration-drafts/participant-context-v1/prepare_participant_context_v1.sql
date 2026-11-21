@@ -14,8 +14,12 @@ set local createrole_self_grant = '';
 -- Deployment principal (superuser NOT assumed; Supabase `postgres` is not one). The
 -- preflight aborts before any DDL unless it has: CREATEROLE; ownership of both base
 -- tables (policies and column grants); CREATE with grant option on public (functions and
--- the temporary CREATE for the new owner); and grant options on the Supabase-managed
--- auth schema and auth.uid(). These are catalog facts to confirm in homologation.
+-- the temporary CREATE for the new owner); and CREATE on the database (private schema).
+-- No privilege on the Supabase-managed auth schema is needed or granted: on hosted
+-- Supabase `postgres` holds USAGE on auth without grant option, so a custom role cannot
+-- be given auth.uid() (Supabase KB "permission errors when granting custom roles access
+-- to the auth schema"). The executor reads the caller id from the PostgREST JWT claims
+-- through a private SECURITY INVOKER helper instead (KB option 2), same source as auth.uid().
 do $preflight$
 begin
   if pg_catalog.current_setting('server_version_num')::integer < 170000 then
@@ -86,7 +90,8 @@ begin
   ) then
     raise exception 'PARTICIPANT_CONTEXT_NAME_COLLISION';
   end if;
-  if pg_catalog.to_regrole('atos_participant_context_reader') is not null then
+  if pg_catalog.to_regrole('atos_participant_context_reader') is not null
+    or pg_catalog.to_regnamespace('atos_participant_context') is not null then
     raise exception 'PARTICIPANT_CONTEXT_NAME_COLLISION';
   end if;
   if not exists (
@@ -103,19 +108,8 @@ begin
   ) or not pg_catalog.has_schema_privilege(current_user, 'public', 'CREATE WITH GRANT OPTION') then
     raise exception 'PARTICIPANT_CONTEXT_REQUIRES_OBJECT_OWNER';
   end if;
-  -- Existence first, privileges second: OR operands have no guaranteed evaluation order.
-  if pg_catalog.to_regnamespace('auth') is null
-    or pg_catalog.to_regprocedure('auth.uid()') is null then
-    raise exception 'PARTICIPANT_CONTEXT_AUTH_GRANT_UNAVAILABLE';
-  end if;
-  if not exists (
-    select 1 from pg_catalog.pg_proc as p
-    where p.oid = pg_catalog.to_regprocedure('auth.uid()')
-      and p.prorettype = 'uuid'::pg_catalog.regtype and not p.proretset
-  ) or not pg_catalog.has_schema_privilege(current_user, 'auth', 'USAGE WITH GRANT OPTION')
-    or not pg_catalog.has_function_privilege(current_user,
-      pg_catalog.to_regprocedure('auth.uid()'), 'EXECUTE WITH GRANT OPTION') then
-    raise exception 'PARTICIPANT_CONTEXT_AUTH_GRANT_UNAVAILABLE';
+  if not pg_catalog.has_database_privilege(current_user, pg_catalog.current_database(), 'CREATE') then
+    raise exception 'PARTICIPANT_CONTEXT_REQUIRES_SCHEMA_CREATE';
   end if;
 end;
 $preflight$;
@@ -128,8 +122,28 @@ create role atos_participant_context_reader
 -- No ALTER DEFAULT PRIVILEGES FOR ROLE: defaults only affect objects that role creates,
 -- and it creates none (the functions are created by the deployer, whose ACL is set
 -- explicitly below). It would also fail: it requires the deployer to inherit the role.
-grant usage on schema public, auth to atos_participant_context_reader;
-grant execute on function auth.uid() to atos_participant_context_reader;
+
+-- Caller identity without the auth schema. Same expression as Supabase's auth.uid():
+-- PostgREST sets request.jwt.claims (and legacy request.jwt.claim.sub) per request from
+-- the verified JWT; SECURITY DEFINER callers still see these session settings. SECURITY
+-- INVOKER, empty search_path, no table access, NULL when no claims. Private schema: not
+-- exposed by the Data API, no PUBLIC/API-role access; only the executor may call it.
+create schema atos_participant_context;
+revoke all privileges on schema atos_participant_context from public, anon, authenticated, service_role;
+create function atos_participant_context.request_user_id()
+returns uuid
+language sql stable security invoker
+set search_path = ''
+as $request_user_id$
+  select coalesce(
+    nullif(pg_catalog.current_setting('request.jwt.claim.sub', true), ''),
+    (nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub')
+  )::uuid
+$request_user_id$;
+revoke all privileges on function atos_participant_context.request_user_id()
+  from public, anon, authenticated, service_role;
+grant usage on schema public, atos_participant_context to atos_participant_context_reader;
+grant execute on function atos_participant_context.request_user_id() to atos_participant_context_reader;
 grant select (racha_id, perfil_id, papel) on public.racha_membros to atos_participant_context_reader;
 grant select (id, racha_id, perfil_id, estrelas_travadas) on public.participantes to atos_participant_context_reader;
 
@@ -138,16 +152,18 @@ grant select (id, racha_id, perfil_id, estrelas_travadas) on public.participante
 -- permissive PUBLIC policy happens to apply. Review restrictive policies as well.
 create policy participant_context_membership_v1 on public.racha_membros
   for select to atos_participant_context_reader
-  using (auth.uid() is not null and perfil_id = auth.uid()
+  using (atos_participant_context.request_user_id() is not null
+    and perfil_id = atos_participant_context.request_user_id()
     and papel in ('normal'::public.papel_usuario, 'admin'::public.papel_usuario));
 
 create policy participant_context_participants_v1 on public.participantes
   for select to atos_participant_context_reader
-  using (auth.uid() is not null and exists (
+  using (atos_participant_context.request_user_id() is not null and exists (
     select 1 from public.racha_membros as m
-    where m.racha_id = participantes.racha_id and m.perfil_id = auth.uid()
+    where m.racha_id = participantes.racha_id and m.perfil_id = atos_participant_context.request_user_id()
       and (m.papel = 'admin'::public.papel_usuario
-        or (m.papel = 'normal'::public.papel_usuario and participantes.perfil_id = auth.uid()))
+        or (m.papel = 'normal'::public.papel_usuario
+          and participantes.perfil_id = atos_participant_context.request_user_id()))
   ));
 
 create function public.obter_meu_participante_v1(p_racha_id uuid)
@@ -162,7 +178,7 @@ declare
   v_count bigint;
   v_id uuid;
 begin
-  v_uid := auth.uid();
+  v_uid := atos_participant_context.request_user_id();
   if v_uid is null or p_racha_id is null then
     raise exception using errcode = '42501', message = 'PARTICIPANT_CONTEXT_DENIED';
   end if;
@@ -209,7 +225,7 @@ declare
   v_valid boolean;
   v_result jsonb;
 begin
-  v_uid := auth.uid();
+  v_uid := atos_participant_context.request_user_id();
   if v_uid is null or p_racha_id is null then
     raise exception using errcode = '42501', message = 'PARTICIPANT_CONTEXT_DENIED';
   end if;
@@ -315,6 +331,9 @@ begin
     or exists (select 1 from pg_catalog.pg_roles where oid = v_reader and
       (rolcanlogin or rolsuper or rolcreatedb or rolcreaterole or rolinherit or rolreplication or rolbypassrls))
     or pg_catalog.has_schema_privilege(v_reader, 'public', 'CREATE')
+    or pg_catalog.has_schema_privilege(v_reader, 'atos_participant_context', 'CREATE')
+    -- No dependency on, nor access to, the Supabase-managed auth schema.
+    or pg_catalog.has_schema_privilege(v_reader, 'auth', 'USAGE')
     or pg_catalog.has_schema_privilege(v_reader, 'auth', 'CREATE') then
     raise exception 'PARTICIPANT_CONTEXT_EXECUTOR_PRIVILEGES';
   end if;
@@ -357,6 +376,46 @@ begin
         or not pg_catalog.has_function_privilege('authenticated', p.oid, 'EXECUTE'))
   ) then
     raise exception 'PARTICIPANT_CONTEXT_UNEXPECTED_RPC_ACL';
+  end if;
+  -- Private identity helper: exactly one invoker function owned by the deployer, usable
+  -- only by the executor; no API role reaches the schema or the helper.
+  if pg_catalog.to_regprocedure('atos_participant_context.request_user_id()') is null then
+    raise exception 'PARTICIPANT_CONTEXT_UNEXPECTED_IDENTITY_ACL';
+  end if;
+  if exists (
+    select 1 from pg_catalog.pg_namespace as n
+    where n.nspname = 'atos_participant_context' and n.nspowner <> v_creator
+  ) or (
+    select pg_catalog.count(*) from pg_catalog.pg_proc as p
+    where p.pronamespace = 'atos_participant_context'::pg_catalog.regnamespace
+  ) <> 1 or exists (
+    select 1 from pg_catalog.pg_class as c
+    where c.relnamespace = 'atos_participant_context'::pg_catalog.regnamespace
+  ) or not exists (
+    select 1 from pg_catalog.pg_proc as p
+    where p.oid = pg_catalog.to_regprocedure('atos_participant_context.request_user_id()')
+      and p.proowner = v_creator and not p.prosecdef and p.provolatile = 's'
+      and p.prorettype = 'uuid'::pg_catalog.regtype and not p.proretset
+  ) or exists (
+    select 1 from pg_catalog.pg_namespace as n
+    cross join lateral pg_catalog.aclexplode(coalesce(n.nspacl, pg_catalog.acldefault('n', n.nspowner))) as acl
+    where n.nspname = 'atos_participant_context' and acl.grantee <> n.nspowner
+      and not (acl.grantee = v_reader and acl.privilege_type = 'USAGE' and not acl.is_grantable)
+  ) or exists (
+    select 1 from pg_catalog.pg_proc as p
+    cross join lateral pg_catalog.aclexplode(coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))) as acl
+    where p.oid = pg_catalog.to_regprocedure('atos_participant_context.request_user_id()')
+      and acl.grantee <> p.proowner
+      and not (acl.grantee = v_reader and acl.privilege_type = 'EXECUTE' and not acl.is_grantable)
+  ) or not pg_catalog.has_schema_privilege(v_reader, 'atos_participant_context', 'USAGE')
+    or not pg_catalog.has_function_privilege(v_reader, 'atos_participant_context.request_user_id()', 'EXECUTE')
+    or pg_catalog.has_schema_privilege('anon', 'atos_participant_context', 'USAGE')
+    or pg_catalog.has_schema_privilege('authenticated', 'atos_participant_context', 'USAGE')
+    or pg_catalog.has_schema_privilege('service_role', 'atos_participant_context', 'USAGE')
+    or pg_catalog.has_function_privilege('anon', 'atos_participant_context.request_user_id()', 'EXECUTE')
+    or pg_catalog.has_function_privilege('authenticated', 'atos_participant_context.request_user_id()', 'EXECUTE')
+    or pg_catalog.has_function_privilege('service_role', 'atos_participant_context.request_user_id()', 'EXECUTE') then
+    raise exception 'PARTICIPANT_CONTEXT_UNEXPECTED_IDENTITY_ACL';
   end if;
 end;
 $acl_guard$;
